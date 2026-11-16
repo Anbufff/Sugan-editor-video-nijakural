@@ -9,6 +9,7 @@ import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.effect.Presentation
 import androidx.media3.exoplayer.ExoPlayer
 import com.actioncut.core.media.export.EffectMapper
 import com.actioncut.core.model.Clip
@@ -29,8 +30,8 @@ import javax.inject.Inject
 import kotlin.math.abs
 
 /**
- * Thin wrapper around an [ExoPlayer] for the editor preview, plus non-blocking
- * frame capture for the Capture tool.
+ * Thin wrapper around an [ExoPlayer] for the editor preview. Uses low-res (480p)
+ * preview scaling for maximum smoothness while leaving export quality 100% untouched.
  */
 class PlayerController @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -38,6 +39,9 @@ class PlayerController @Inject constructor(
     val player: ExoPlayer = ExoPlayer.Builder(context).build().apply {
         playWhenReady = false
         repeatMode = Player.REPEAT_MODE_OFF
+        trackSelectionParameters = trackSelectionParameters.buildUpon()
+            .setMaxVideoSize(854, 480)
+            .build()
     }
 
     private val audioPlayer: ExoPlayer = ExoPlayer.Builder(context).build().apply {
@@ -49,6 +53,9 @@ class PlayerController @Inject constructor(
         playWhenReady = false
         repeatMode = Player.REPEAT_MODE_OFF
         volume = 0f
+        trackSelectionParameters = trackSelectionParameters.buildUpon()
+            .setMaxVideoSize(640, 360)
+            .build()
     }
 
     private val _state = MutableStateFlow(PlaybackState())
@@ -134,6 +141,15 @@ class PlayerController @Inject constructor(
         pushState()
     }
 
+    /** Restores preview decoders/surfaces after Home button or screen-off resume. */
+    fun restoreAfterResume(timeline: Timeline, positionMs: Long) {
+        if (player.playbackState == Player.STATE_IDLE) {
+            setTimeline(timeline)
+        }
+        seekTo(positionMs)
+        applyPreviewEffects(force = true)
+    }
+
     private fun previewDurationMs(clip: Clip): Long = clip.timelineDurationMs.coerceAtLeast(1L)
 
     private fun cumulativeStarts(durations: List<Long>): List<Long> {
@@ -216,7 +232,14 @@ class PlayerController @Inject constructor(
         val signature = previewEffectSignature(clip)
         if (!force && signature == lastPreviewSignature) return
         lastPreviewSignature = signature
-        val effects: List<Effect> = clip?.let { EffectMapper.previewVideoEffects(it) } ?: emptyList()
+        // Downscale preview processing to 480p for smooth playback without affecting export quality.
+        val effects: List<Effect> = clip?.let {
+            if (it.type == ClipType.VIDEO) {
+                listOf(Presentation.createForHeight(480)) + EffectMapper.previewVideoEffects(it)
+            } else {
+                EffectMapper.previewVideoEffects(it)
+            }
+        } ?: emptyList()
         runCatching {
             player.setVideoEffects(effects)
             if (!player.isPlaying && player.playbackState == Player.STATE_READY) {
@@ -248,11 +271,13 @@ class PlayerController @Inject constructor(
 
     fun pause() {
         player.pause()
+        audioPlayer.pause()
+        pipPlayer.pause()
     }
 
     fun togglePlayPause() {
         if (player.isPlaying) {
-            player.pause()
+            pause()
         } else {
             if (player.playbackState == Player.STATE_ENDED) seekTo(0)
             player.play()
@@ -275,7 +300,8 @@ class PlayerController @Inject constructor(
     }
 
     /**
-     * Captures a high-res JPEG frame from [clip] at [playheadMs] without interrupting active playback.
+     * Captures a high-res JPEG frame from [clip] into permanent `filesDir/captures` so it
+     * never disappears on Home/screen-off.
      */
     suspend fun captureFrame(clip: Clip, playheadMs: Long): String? = withContext(Dispatchers.IO) {
         val uri = clip.mediaUri ?: return@withContext null
@@ -287,7 +313,8 @@ class PlayerController @Inject constructor(
             val bmp = retriever.getFrameAtTime(sourceUs, MediaMetadataRetriever.OPTION_CLOSEST)
                 ?: retriever.getFrameAtTime(sourceUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 ?: return@runCatching null
-            val outFile = File(context.cacheDir, "capture_${System.currentTimeMillis()}.jpg")
+            val capDir = File(context.filesDir, "captures").apply { mkdirs() }
+            val outFile = File(capDir, "capture_${System.currentTimeMillis()}.jpg")
             outFile.outputStream().use { out ->
                 bmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
             }
