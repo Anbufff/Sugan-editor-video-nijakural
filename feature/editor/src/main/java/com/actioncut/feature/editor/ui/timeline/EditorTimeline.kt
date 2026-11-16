@@ -21,24 +21,28 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Audiotrack
+import androidx.compose.material.icons.filled.AutoFixHigh
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
@@ -55,6 +59,7 @@ import com.actioncut.core.model.ClipType
 import com.actioncut.core.model.Timeline
 import com.actioncut.core.model.Track
 import com.actioncut.core.model.TrackType
+import com.actioncut.core.model.TransitionType
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -63,9 +68,8 @@ private const val RULER_HEIGHT = 22
 private const val HANDLE_WIDTH = 14
 
 /**
- * CapCut-style timeline: a fixed center playhead with content scrolling beneath it. The
- * horizontal scroll offset *is* the current time, giving smooth, low-latency scrubbing.
- * Supports multi-track lanes, clip selection and drag-to-trim on the selected clip.
+ * CapCut-style timeline with transition diamond boxes, yellow capture marks,
+ * audio lock badges, and keyframe diamonds.
  */
 @Composable
 fun EditorTimeline(
@@ -82,6 +86,9 @@ fun EditorTimeline(
     onMoveClip: (String, Long) -> Unit = { _, _ -> },
     onMoveCommit: () -> Unit = {},
     onLoadWaveform: (suspend (String) -> FloatArray)? = null,
+    onTransitionClick: (String) -> Unit = {},
+    onLongPressClip: (String) -> Unit = {},
+    onSelectKeyframe: (Long) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
@@ -91,15 +98,12 @@ fun EditorTimeline(
     fun msToPxF(ms: Long): Float = ms / 1000f * pxPerSecond
     fun pxToMs(px: Int): Long = (px / pxPerSecond * 1000f).toLong()
 
-    // User scroll -> seek. Suppressed while playing, where the playhead drives the scroll
-    // (otherwise the follow-scroll feeds back as a scrub and fights playback).
     LaunchedEffect(scrollState, pxPerSecond, durationMs) {
         snapshotFlow { scrollState.value to scrollState.isScrollInProgress }
             .collect { (value, inProgress) ->
                 if (inProgress && !isPlaying) onScrub(pxToMs(value).coerceIn(0, durationMs))
             }
     }
-    // Playhead (playback / edits) -> follow scroll, unless the user is actively scrolling.
     LaunchedEffect(playheadMs, isPlaying) {
         if (!scrollState.isScrollInProgress) {
             val target = msToPxF(playheadMs).roundToInt()
@@ -125,6 +129,7 @@ fun EditorTimeline(
                 orderedTracks.forEach { track ->
                     TrackLane(
                         track = track,
+                        playheadMs = playheadMs,
                         pxPerSecond = pxPerSecond,
                         contentWidthDp = contentWidthDp,
                         selectedClipId = selectedClipId,
@@ -134,6 +139,9 @@ fun EditorTimeline(
                         onMoveClip = onMoveClip,
                         onMoveCommit = onMoveCommit,
                         onLoadWaveform = onLoadWaveform,
+                        onTransitionClick = onTransitionClick,
+                        onLongPressClip = onLongPressClip,
+                        onSelectKeyframe = onSelectKeyframe,
                     )
                 }
             }
@@ -161,7 +169,6 @@ fun EditorTimeline(
 @Composable
 private fun TimeRuler(durationMs: Long, pxPerSecond: Float, widthDp: androidx.compose.ui.unit.Dp) {
     val totalSeconds = (durationMs / 1000).toInt()
-    // Adaptive tick spacing so labels never crowd at low zoom.
     val step = when {
         pxPerSecond >= 120 -> 1
         pxPerSecond >= 60 -> 2
@@ -188,6 +195,7 @@ private fun TimeRuler(durationMs: Long, pxPerSecond: Float, widthDp: androidx.co
 @Composable
 private fun TrackLane(
     track: Track,
+    playheadMs: Long,
     pxPerSecond: Float,
     contentWidthDp: androidx.compose.ui.unit.Dp,
     selectedClipId: String?,
@@ -197,6 +205,9 @@ private fun TrackLane(
     onMoveClip: (String, Long) -> Unit,
     onMoveCommit: () -> Unit,
     onLoadWaveform: (suspend (String) -> FloatArray)?,
+    onTransitionClick: (String) -> Unit,
+    onLongPressClip: (String) -> Unit,
+    onSelectKeyframe: (Long) -> Unit,
 ) {
     val density = LocalDensity.current
     Box(
@@ -210,6 +221,7 @@ private fun TrackLane(
             Box(modifier = Modifier.offset(x = xDp).fillMaxHeight()) {
                 ClipBlock(
                     clip = clip,
+                    playheadMs = playheadMs,
                     pxPerSecond = pxPerSecond,
                     selected = clip.id == selectedClipId,
                     onSelect = { onSelectClip(clip.id) },
@@ -218,7 +230,37 @@ private fun TrackLane(
                     onMoveClip = onMoveClip,
                     onMoveCommit = onMoveCommit,
                     onLoadWaveform = onLoadWaveform,
+                    onLongPressClip = onLongPressClip,
+                    onSelectKeyframe = onSelectKeyframe,
                 )
+            }
+        }
+
+        // Transition diamond badges between adjacent main video clips
+        if (track.type == TrackType.VIDEO && track.clips.size > 1) {
+            for (i in 0 until track.clips.lastIndex) {
+                val clip = track.clips[i]
+                val hasTransition = clip.transitionToNext != null && clip.transitionToNext!!.type != TransitionType.NONE
+                val boundaryX = with(density) { (clip.timelineEndMs / 1000f * pxPerSecond).toDp() }
+                Box(
+                    modifier = Modifier
+                        .offset(x = boundaryX - 9.dp)
+                        .align(Alignment.CenterStart)
+                        .size(18.dp)
+                        .rotate(45f)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(if (hasTransition) Color(0xFF00E5FF) else Color.White)
+                        .border(1.dp, Color.Black, RoundedCornerShape(3.dp))
+                        .clickableNoRipple { onTransitionClick(clip.id) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = if (hasTransition) Icons.Filled.AutoFixHigh else Icons.Filled.Edit,
+                        contentDescription = "Transition",
+                        tint = Color.Black,
+                        modifier = Modifier.size(10.dp).rotate(-45f),
+                    )
+                }
             }
         }
     }
@@ -227,6 +269,7 @@ private fun TrackLane(
 @Composable
 private fun ClipBlock(
     clip: Clip,
+    playheadMs: Long,
     pxPerSecond: Float,
     selected: Boolean,
     onSelect: () -> Unit,
@@ -235,6 +278,8 @@ private fun ClipBlock(
     onMoveClip: (String, Long) -> Unit = { _, _ -> },
     onMoveCommit: () -> Unit = {},
     onLoadWaveform: (suspend (String) -> FloatArray)? = null,
+    onLongPressClip: (String) -> Unit = {},
+    onSelectKeyframe: (Long) -> Unit = {},
 ) {
     val density = LocalDensity.current
     val widthDp = with(density) { (clip.timelineDurationMs / 1000f * pxPerSecond).toDp() }
@@ -250,7 +295,7 @@ private fun ClipBlock(
             .background(laneColor(clip.type))
             .border(2.dp, borderColor, RoundedCornerShape(6.dp))
             .clickableNoRipple { onSelect() }
-            .pointerInput(clip.id, pxPerSecond) {
+            .pointerInput(clip.id, pxPerSecond, clip.isLocked) {
                 detectDragGesturesAfterLongPress(
                     onDragStart = {
                         onSelect()
@@ -258,10 +303,16 @@ private fun ClipBlock(
                         moveAcc = 0f
                     },
                     onDrag = { _, drag ->
-                        moveAcc += drag.x
-                        onMoveClip(clip.id, moveAnchor + (moveAcc / pxPerSecond * 1000f).toLong())
+                        if (!clip.isLocked) {
+                            moveAcc += drag.x
+                            onMoveClip(clip.id, moveAnchor + (moveAcc / pxPerSecond * 1000f).toLong())
+                        }
                     },
-                    onDragEnd = { onMoveCommit() },
+                    onDragEnd = {
+                        if (!clip.isLocked) {
+                            if (abs(moveAcc) < 4f) onLongPressClip(clip.id) else onMoveCommit()
+                        }
+                    },
                 )
             },
         contentAlignment = Alignment.CenterStart,
@@ -273,6 +324,27 @@ private fun ClipBlock(
                 modifier = Modifier.matchParentSize(),
             )
         }
+
+        // Yellow screenshot capture marks on video clips
+        if (clip.captureMarksMs.isNotEmpty()) {
+            Canvas(modifier = Modifier.matchParentSize()) {
+                clip.captureMarksMs.forEach { relMs ->
+                    val x = (relMs / 1000f * pxPerSecond).coerceIn(0f, size.width)
+                    drawLine(
+                        color = Color(0xFFFFE300),
+                        start = Offset(x, 0f),
+                        end = Offset(x, size.height),
+                        strokeWidth = 3f,
+                    )
+                    drawCircle(
+                        color = Color(0xFFFFE300),
+                        radius = 5f,
+                        center = Offset(x, 5f),
+                    )
+                }
+            }
+        }
+
         Row(
             modifier = Modifier.padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -291,9 +363,35 @@ private fun ClipBlock(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (clip.isLocked) {
+                Spacer(Modifier.width(4.dp))
+                Icon(
+                    imageVector = Icons.Filled.Lock,
+                    contentDescription = "Locked",
+                    tint = Color.White,
+                    modifier = Modifier.size(12.dp),
+                )
+            }
         }
 
-        if (selected) {
+        // Keyframe diamonds
+        clip.keyframes.forEach { kf ->
+            val kfX = with(density) { (kf.timeMs / 1000f * pxPerSecond).toDp() }
+            val isNear = abs(playheadMs - (clip.timelineStartMs + kf.timeMs)) < 200L
+            Box(
+                modifier = Modifier
+                    .offset(x = kfX - 5.dp)
+                    .align(Alignment.BottomStart)
+                    .padding(bottom = 3.dp)
+                    .size(9.dp)
+                    .rotate(45f)
+                    .background(if (isNear) Color(0xFFFF3B5C) else Color(0xFFFFE300))
+                    .border(1.dp, Color.Black)
+                    .clickableNoRipple { onSelectKeyframe(clip.timelineStartMs + kf.timeMs) },
+            )
+        }
+
+        if (selected && !clip.isLocked) {
             ClipTrimHandles(
                 clip = clip,
                 pxPerSecond = pxPerSecond,
@@ -341,14 +439,12 @@ private fun ClipTrimHandles(
     onTrimEnd: (String, Long) -> Unit,
 ) {
     Box(Modifier.fillMaxWidth().fillMaxHeight()) {
-        // Left handle -> trim start.
         DragHandle(
             modifier = Modifier.align(Alignment.CenterStart),
             initialValue = clip.timelineStartMs,
             pxPerSecond = pxPerSecond,
             onValue = { onTrimStart(clip.id, it) },
         )
-        // Right handle -> trim end.
         DragHandle(
             modifier = Modifier.align(Alignment.CenterEnd),
             initialValue = clip.timelineEndMs,
@@ -395,8 +491,6 @@ private fun DragHandle(
     }
 }
 
-/** Placeholder overload removed. */
-
 private fun laneColor(type: ClipType): Color = when (type) {
     ClipType.VIDEO -> LaneVideo
     ClipType.IMAGE -> LaneVideo
@@ -415,6 +509,7 @@ private fun clipIcon(type: ClipType) = when (type) {
 
 private fun clipLabel(clip: Clip): String = when (clip.type) {
     ClipType.TEXT -> clip.text?.text ?: "Text"
+    ClipType.STICKER -> clip.text?.text?.takeIf { it.isNotBlank() } ?: clip.stickerTemplate.displayName
     ClipType.AUDIO -> "Audio"
     else -> clip.mediaUri?.substringAfterLast('/')?.take(14) ?: clip.type.name
 }
