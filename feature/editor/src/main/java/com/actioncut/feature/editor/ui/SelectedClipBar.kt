@@ -2,6 +2,7 @@ package com.actioncut.feature.editor.ui
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -9,9 +10,9 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,9 +22,8 @@ import androidx.compose.ui.unit.dp
 import com.actioncut.core.designsystem.component.ToolItem
 
 /**
- * Contextual action bar shown above the toolbar whenever a clip is selected. Surfaces the
- * most-used clip actions — **Split, Duplicate, Delete** — as large, always-visible buttons
- * so deleting a clip no longer requires hunting through the end of the scrolling toolbar.
+ * Contextual clip action bar shown above the toolbar whenever a clip is selected.
+ * Places [Replace] directly on the left of [Split] (replacing the old "Clip" label).
  */
 @Composable
 fun SelectedClipBar(
@@ -32,6 +32,8 @@ fun SelectedClipBar(
     onDelete: () -> Unit,
     onDeselect: () -> Unit,
     modifier: Modifier = Modifier,
+    onReplace: () -> Unit = {},
+    showReplace: Boolean = true,
 ) {
     Surface(
         modifier = modifier
@@ -41,20 +43,17 @@ fun SelectedClipBar(
         tonalElevation = 2.dp,
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            Text(
-                text = "Clip",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(end = 8.dp),
-            )
+            if (showReplace) {
+                ToolItem(label = "Replace", icon = Icons.Filled.SwapHoriz, onClick = onReplace)
+            }
             ToolItem(label = "Split", icon = Icons.Filled.ContentCut, onClick = onSplit)
             ToolItem(label = "Duplicate", icon = Icons.Filled.ContentCopy, onClick = onDuplicate)
             ToolItem(label = "Delete", icon = Icons.Filled.DeleteOutline, onClick = onDelete)
-            androidx.compose.foundation.layout.Spacer(Modifier.weight(1f))
+            Spacer(Modifier.weight(1f))
             ToolItem(label = "Done", icon = Icons.Filled.Done, onClick = onDeselect)
         }
     }
