@@ -22,8 +22,6 @@ android {
         freeCompilerArgs += "-opt-in=androidx.media3.common.util.UnstableApi"
     }
     lint {
-        // This module is a deliberate, module-wide Media3 integration (opted in via the
-        // compiler arg above), so silence the opt-in lint error to match.
         disable += "UnsafeOptInUsageError"
     }
 }
@@ -36,10 +34,9 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.kotlinx.coroutines.android)
 
-    // Expose Media3 to consumers (editor preview needs PlayerView/ExoPlayer types).
     api(libs.bundles.media3)
-    // Guava is required to construct Media3 OverlayEffect (ImmutableList parameter).
     implementation("com.google.guava:guava:33.3.1-android")
+    implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
 
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
