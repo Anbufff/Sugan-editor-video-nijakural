@@ -1,10 +1,12 @@
 package com.actioncut.core.media.export
 
 import android.content.Context
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.Size
 import androidx.media3.effect.OverlaySettings
 import androidx.media3.effect.Presentation
@@ -208,7 +210,9 @@ class Media3VideoExporter @Inject constructor(
         outgoing: Transition? = null,
     ): EditedMediaItem {
         val mediaItemBuilder = MediaItem.Builder().setUri(mediaUri)
-        if (type != ClipType.IMAGE) {
+        if (type == ClipType.IMAGE) {
+            mediaItemBuilder.setMimeType(resolveImageMimeType(mediaUri))
+        } else {
             mediaItemBuilder.setClippingConfiguration(
                 MediaItem.ClippingConfiguration.Builder()
                     .setStartPositionMs(sourceInMs)
@@ -259,6 +263,18 @@ class Media3VideoExporter @Inject constructor(
             builder.setFrameRate(settings.frameRate.fps)
         }
         return builder.build()
+    }
+
+    private fun resolveImageMimeType(uriString: String?): String {
+        if (uriString.isNullOrBlank()) return MimeTypes.IMAGE_JPEG
+        val probed = runCatching { context.contentResolver.getType(Uri.parse(uriString)) }.getOrNull()
+        if (!probed.isNullOrBlank() && MimeTypes.isImage(probed)) return probed
+        val lower = uriString.lowercase()
+        return when {
+            lower.endsWith(".png") -> MimeTypes.IMAGE_PNG
+            lower.endsWith(".webp") -> MimeTypes.IMAGE_WEBP
+            else -> MimeTypes.IMAGE_JPEG
+        }
     }
 
     private fun Clip.toAudioEditedMediaItem(): EditedMediaItem {
