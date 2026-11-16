@@ -75,6 +75,7 @@ import com.actioncut.core.model.TransitionGroup
 import com.actioncut.core.model.TransitionType
 import com.actioncut.core.model.VisualEffectType
 import com.actioncut.feature.editor.ui.EditorTool
+import java.util.Locale
 import kotlin.math.roundToInt
 
 /** Bottom parameter panel that swaps content based on the active [EditorTool]. */
@@ -245,32 +246,50 @@ private fun MainAnimationPanel(
             SectionHeader("Group 1: Panning")
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(listOf(MainAnimation.NONE) + MainAnimations.panPool) { anim ->
-                    SelectableChip(anim.displayName, picked == anim) { picked = anim }
+                    SelectableChip(
+                        label = anim.displayName,
+                        selected = picked == anim,
+                        onClick = { picked = anim },
+                    )
                 }
             }
             SectionHeader("Group 2: Zooming")
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(MainAnimations.zoomPool) { anim ->
-                    SelectableChip(anim.displayName, picked == anim) { picked = anim }
+                    SelectableChip(
+                        label = anim.displayName,
+                        selected = picked == anim,
+                        onClick = { picked = anim },
+                    )
                 }
             }
             SectionHeader("Group 3: Fit Ken Burns (Full Screen)")
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(MainAnimations.fitPool) { anim ->
-                    SelectableChip(anim.displayName, picked == anim) { picked = anim }
+                    SelectableChip(
+                        label = anim.displayName,
+                        selected = picked == anim,
+                        onClick = { picked = anim },
+                    )
                 }
             }
             SectionHeader("Group 4: Combo Curve")
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(MainAnimations.comboPool) { anim ->
-                    SelectableChip(anim.displayName, picked == anim) { picked = anim }
+                    SelectableChip(
+                        label = anim.displayName,
+                        selected = picked == anim,
+                        onClick = { picked = anim },
+                    )
                 }
             }
             SectionHeader("Group 5: Split Zoom In-Out")
             Row {
-                SelectableChip(MainAnimation.ZOOM_IN_OUT.displayName, picked == MainAnimation.ZOOM_IN_OUT) {
-                    picked = MainAnimation.ZOOM_IN_OUT
-                }
+                SelectableChip(
+                    label = MainAnimation.ZOOM_IN_OUT.displayName,
+                    selected = picked == MainAnimation.ZOOM_IN_OUT,
+                    onClick = { picked = MainAnimation.ZOOM_IN_OUT },
+                )
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
@@ -301,7 +320,7 @@ private fun DurationPanel(
             value = sec,
             onValueChange = { sec = (it * 2f).roundToInt() / 2f },
             valueRange = 0.5f..60f,
-            valueFormatter = { "${"%.1f".format(it)}s" },
+            valueFormatter = { String.format(Locale.US, "%.1fs", it) },
         )
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             SecondaryButton("Apply All", { onApplyAll((sec * 1000f).toLong()) }, Modifier.weight(1f))
@@ -338,7 +357,7 @@ private fun SpeedPanel(
             value = keepDurSpeed,
             onValueChange = { keepDurSpeed = (it * 10f).roundToInt() / 10f },
             valueRange = 0.1f..4.0f,
-            valueFormatter = { "${"%.1f".format(it)}x" },
+            valueFormatter = { String.format(Locale.US, "%.1fx", it) },
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             SecondaryButton("Apply All", { onKeepDurAll(keepDurSpeed) }, Modifier.weight(1f))
@@ -589,10 +608,18 @@ private fun TransitionPanel(
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             item {
-                SelectableChip("All", selectedGroup == null) { selectedGroup = null }
+                SelectableChip(
+                    label = "All",
+                    selected = selectedGroup == null,
+                    onClick = { selectedGroup = null },
+                )
             }
             items(TransitionGroup.entries.filter { it != TransitionGroup.NONE }) { grp ->
-                SelectableChip(grp.displayName, selectedGroup == grp) { selectedGroup = grp }
+                SelectableChip(
+                    label = grp.displayName,
+                    selected = selectedGroup == grp,
+                    onClick = { selectedGroup = grp },
+                )
             }
         }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
