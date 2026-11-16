@@ -9,7 +9,6 @@ import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import androidx.media3.effect.Presentation
 import androidx.media3.exoplayer.ExoPlayer
 import com.actioncut.core.media.export.EffectMapper
 import com.actioncut.core.model.Clip
@@ -31,7 +30,7 @@ import kotlin.math.abs
 
 /**
  * Thin wrapper around an [ExoPlayer] for the editor preview. Uses low-res (480p)
- * preview scaling for maximum smoothness while leaving export quality 100% untouched.
+ * decoder constraints for smooth playback while keeping export quality 100% untouched.
  */
 class PlayerController @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -164,9 +163,8 @@ class PlayerController @Inject constructor(
     fun restoreAfterResume(timeline: Timeline, positionMs: Long) {
         if (player.playbackState == Player.STATE_IDLE) {
             setTimeline(timeline)
+            seekTo(positionMs)
         }
-        seekTo(positionMs)
-        applyPreviewEffects(force = true)
     }
 
     private fun previewDurationMs(clip: Clip): Long = clip.timelineDurationMs.coerceAtLeast(1L)
@@ -251,13 +249,7 @@ class PlayerController @Inject constructor(
         val signature = previewEffectSignature(clip)
         if (!force && signature == lastPreviewSignature) return
         lastPreviewSignature = signature
-        val effects: List<Effect> = clip?.let {
-            if (it.type == ClipType.VIDEO) {
-                listOf(Presentation.createForHeight(480)) + EffectMapper.previewVideoEffects(it)
-            } else {
-                EffectMapper.previewVideoEffects(it)
-            }
-        } ?: emptyList()
+        val effects: List<Effect> = clip?.let { EffectMapper.previewVideoEffects(it) } ?: emptyList()
         runCatching {
             player.setVideoEffects(effects)
             if (!player.isPlaying && player.playbackState == Player.STATE_READY) {
