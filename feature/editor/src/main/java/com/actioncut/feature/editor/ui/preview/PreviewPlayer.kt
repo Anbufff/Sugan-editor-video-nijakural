@@ -1,8 +1,10 @@
 package com.actioncut.feature.editor.ui.preview
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.util.LruCache
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -47,10 +49,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
@@ -73,14 +78,43 @@ import com.actioncut.core.media.export.SelfieCutout
 import com.actioncut.core.model.AspectRatio
 import com.actioncut.core.model.Clip
 import com.actioncut.core.model.ClipType
+import com.actioncut.core.model.ColorAdjustments
 import com.actioncut.core.model.FitMode
 import com.actioncut.core.model.Keyframes
+import com.actioncut.core.model.MainAnimations
 import com.actioncut.core.model.StickerTemplate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.sin
+import kotlin.math.max
+
+/** In-memory low-res cache for fast 60fps photo preview scrubbing (export uses full res). */
+private object PreviewBitmapCache {
+    private val cache = LruCache<String, ImageBitmap>(24)
+
+    fun get(uri: String): ImageBitmap? = cache.get(uri)
+
+    fun loadDownsampled(context: Context, uri: String, maxDim: Int = 854): ImageBitmap? {
+        cache.get(uri)?.let { return it }
+        return runCatching {
+            val parsed = Uri.parse(uri)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            context.contentResolver.openInputStream(parsed)?.use {
+                BitmapFactory.decodeStream(it, null, bounds)
+            }
+            var sample = 1
+            val longest = max(bounds.outWidth, bounds.outHeight)
+            while (longest / sample > maxDim * 2) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = context.contentResolver.openInputStream(parsed)?.use {
+                BitmapFactory.decodeStream(it, null, opts)
+            } ?: return@runCatching null
+            val imgBmp = bmp.asImageBitmap()
+            cache.put(uri, imgBmp)
+            imgBmp
+        }.getOrNull()
+    }
+}
 
 @Composable
 fun PreviewPlayer(
@@ -110,6 +144,8 @@ fun PreviewPlayer(
         FitMode.FILL -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
         FitMode.STRETCH -> AspectRatioFrameLayout.RESIZE_MODE_FILL
     }
+    val isImageMain = activeMainClip?.type == ClipType.IMAGE && activeMainClip.mediaUri != null
+
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -118,7 +154,8 @@ fun PreviewPlayer(
     ) {
         BoxWithConstraints(
             modifier = Modifier
-                .aspectRatio(aspectRatio.value)
+                .aspectRatio(16f / 9f)
+                .clip(RoundedCornerShape(2.dp))
                 .background(Color(backgroundColorArgb))
                 .pointerInput(activeMainClip?.id) {
                     val w = size.width.toFloat().coerceAtLeast(1f)
@@ -151,6 +188,7 @@ fun PreviewPlayer(
                 },
             contentAlignment = Alignment.Center,
         ) {
+            // Keep ExoPlayer surface attached for smooth switching, hidden cleanly when displaying a Photo/Capture
             AndroidView(
                 factory = { context ->
                     PlayerView(context).apply {
@@ -164,8 +202,21 @@ fun PreviewPlayer(
                     it.player = player
                     it.resizeMode = resizeMode
                 },
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .alpha(if (isImageMain) 0f else 1f),
             )
+
+            // Fast, lag-free Photo/Screenshot renderer (fixes black screen on capture_*.jpg & Home resume)
+            if (isImageMain && activeMainClip != null) {
+                MainImagePreviewLayer(
+                    clip = activeMainClip,
+                    playheadMs = playheadMs,
+                    fitMode = fitMode,
+                    boxW = constraints.maxWidth.toFloat().coerceAtLeast(1f),
+                    boxH = constraints.maxHeight.toFloat().coerceAtLeast(1f),
+                )
+            }
 
             PipLayer(
                 pipPlayer = pipPlayer,
@@ -208,6 +259,96 @@ fun PreviewPlayer(
             }
         }
     }
+}
+
+@Composable
+private fun MainImagePreviewLayer(
+    clip: Clip,
+    playheadMs: Long,
+    fitMode: FitMode,
+    boxW: Float,
+    boxH: Float,
+) {
+    val context = LocalContext.current
+    val uri = clip.mediaUri ?: return
+    var imgBmp by remember(uri) { mutableStateOf(PreviewBitmapCache.get(uri)) }
+
+    LaunchedEffect(uri) {
+        if (imgBmp == null || PreviewBitmapCache.get(uri) == null) {
+            imgBmp = withContext(Dispatchers.IO) {
+                PreviewBitmapCache.loadDownsampled(context, uri, maxDim = 854)
+            }
+        }
+    }
+
+    val bmp = imgBmp ?: return
+    val dur = clip.timelineDurationMs.coerceAtLeast(1L)
+    val progress = ((playheadMs - clip.timelineStartMs).toFloat() / dur.toFloat()).coerceIn(0f, 1f)
+    val animFrame = MainAnimations.evaluate(
+        anim = clip.mainAnimation,
+        progress = progress,
+        srcW = bmp.width.toFloat(),
+        srcH = bmp.height.toFloat(),
+        frameW = boxW,
+        frameH = boxH,
+    )
+    val totalScale = (animFrame.scale * clip.transform.scale).coerceIn(0.25f, 4f)
+    val tx = (animFrame.offsetX + clip.transform.offsetX) * (boxW / 2f)
+    val ty = (animFrame.offsetY + clip.transform.offsetY) * (boxH / 2f)
+    val colorFilter = remember(clip.adjustments) { adjustmentsColorFilter(clip.adjustments) }
+    val scaleType = when (fitMode) {
+        FitMode.FIT -> ContentScale.Fit
+        FitMode.FILL -> ContentScale.Crop
+        FitMode.STRETCH -> ContentScale.FillBounds
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (clip.blurBackground) {
+            Image(
+                bitmap = bmp,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .blur(20.dp)
+                    .alpha(0.55f),
+            )
+        }
+        Image(
+            bitmap = bmp,
+            contentDescription = null,
+            contentScale = scaleType,
+            colorFilter = colorFilter,
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = totalScale * (if (clip.flipHorizontal) -1f else 1f)
+                    scaleY = totalScale
+                    translationX = tx
+                    translationY = ty
+                    rotationZ = clip.rotationDegrees.toFloat() + clip.transform.rotationDegrees
+                },
+        )
+    }
+}
+
+private fun adjustmentsColorFilter(adj: ColorAdjustments): ColorFilter? {
+    if (adj.isIdentity) return null
+    val matrix = ColorMatrix().apply {
+        if (adj.saturation != 0f) setToSaturation((1f + adj.saturation).coerceIn(0f, 2f))
+    }
+    val c = (1f + adj.contrast).coerceIn(0.2f, 2f)
+    val t = adj.brightness * 255f + (1f - c) * 128f
+    val warmR = 1f + adj.warmth * 0.25f
+    val warmB = 1f - adj.warmth * 0.25f
+    val values = matrix.values
+    values[0] *= c * warmR
+    values[6] *= c
+    values[12] *= c * warmB
+    values[4] += t
+    values[9] += t
+    values[14] += t
+    return ColorFilter.colorMatrix(matrix)
 }
 
 @Composable
@@ -281,8 +422,16 @@ private fun PipLayer(
                     LaunchedEffect(active.mediaUri, active.cutoutEnabled, active.crop) {
                         imgBitmap = withContext(Dispatchers.IO) {
                             runCatching {
-                                val raw = context.contentResolver.openInputStream(Uri.parse(active.mediaUri))?.use {
-                                    BitmapFactory.decodeStream(it)
+                                val parsed = Uri.parse(active.mediaUri)
+                                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                                context.contentResolver.openInputStream(parsed)?.use {
+                                    BitmapFactory.decodeStream(it, null, bounds)
+                                }
+                                var sample = 1
+                                val longest = max(bounds.outWidth, bounds.outHeight)
+                                while (longest / sample > 960) sample *= 2
+                                val raw = context.contentResolver.openInputStream(parsed)?.use {
+                                    BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
                                 } ?: return@runCatching null
                                 val segmented = if (active.cutoutEnabled) {
                                     SelfieCutout.segmentBitmap(raw, active.mediaUri) ?: raw
@@ -322,7 +471,6 @@ private fun PipLayer(
                     )
                 }
 
-                // Resize handle
                 Box(
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
