@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -41,7 +40,6 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PersonOutline
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
@@ -68,6 +66,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.Lifecycle
@@ -86,6 +85,7 @@ import com.actioncut.feature.editor.ui.timeline.EditorTimeline
 import com.actioncut.feature.editor.ui.tools.EditorToolbar
 import com.actioncut.feature.editor.ui.tools.MainTools
 import com.actioncut.feature.editor.ui.tools.ToolPanel
+import kotlinx.coroutines.delay
 
 private const val PREFS_NAME = "actioncut_toolbar_prefs"
 private const val KEY_TOOLBAR_ORDER = "main_toolbar_order"
@@ -105,7 +105,6 @@ fun EditorScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // Persist on Home/Screen-Off & restore decoders cleanly when returning
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -123,8 +122,8 @@ fun EditorScreen(
     }
 
     LaunchedEffect(toastMsg) {
-        toastMsg?.let { msg ->
-            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+        if (toastMsg != null) {
+            delay(2_000L)
             viewModel.consumeToast()
         }
     }
@@ -204,41 +203,65 @@ fun EditorScreen(
             onTitleClick = { showRename = true },
         )
 
-        PreviewPlayer(
-            player = viewModel.playerController.player,
-            aspectRatio = uiState.aspectRatio,
-            isPlaying = uiState.isPlaying,
-            onTogglePlay = viewModel::togglePlayPause,
-            overlays = uiState.timeline.allClips.filter {
-                it.type == ClipType.TEXT || it.type == ClipType.STICKER
-            },
-            playheadMs = uiState.playheadMs,
-            selectedClipId = uiState.selectedClipId,
-            onSelectOverlay = viewModel::selectClip,
-            onMoveOverlay = viewModel::setOverlayPosition,
-            pipPlayer = viewModel.playerController.pipPlayer,
-            pipClips = uiState.timeline.tracks
-                .filter { it.type == TrackType.OVERLAY }
-                .flatMap { it.clips }
-                .filter { it.type == ClipType.VIDEO || it.type == ClipType.IMAGE },
-            onScaleOverlay = viewModel::setOverlayScale,
-            fitMode = uiState.canvas.fitMode,
-            backgroundColorArgb = uiState.canvas.backgroundColorArgb,
-            activeMainClip = activeMainClip,
-            onPanZoomMainClip = viewModel::setMainClipPanZoom,
-            onRotateOverlay = viewModel::setOverlayRotation,
-            onFlipArrow = { clipId ->
-                viewModel.selectClip(clipId)
-                viewModel.flipSelectedHorizontal()
-            },
-            onDoubleTapOverlay = { clipId ->
-                viewModel.selectClip(clipId)
-                showEditTextDialog = true
-            },
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f),
-        )
+        ) {
+            PreviewPlayer(
+                player = viewModel.playerController.player,
+                aspectRatio = uiState.aspectRatio,
+                isPlaying = uiState.isPlaying,
+                onTogglePlay = viewModel::togglePlayPause,
+                overlays = uiState.timeline.allClips.filter {
+                    it.type == ClipType.TEXT || it.type == ClipType.STICKER
+                },
+                playheadMs = uiState.playheadMs,
+                selectedClipId = uiState.selectedClipId,
+                onSelectOverlay = viewModel::selectClip,
+                onMoveOverlay = viewModel::setOverlayPosition,
+                pipPlayer = viewModel.playerController.pipPlayer,
+                pipClips = uiState.timeline.tracks
+                    .filter { it.type == TrackType.OVERLAY }
+                    .flatMap { it.clips }
+                    .filter { it.type == ClipType.VIDEO || it.type == ClipType.IMAGE },
+                onScaleOverlay = viewModel::setOverlayScale,
+                fitMode = uiState.canvas.fitMode,
+                backgroundColorArgb = uiState.canvas.backgroundColorArgb,
+                activeMainClip = activeMainClip,
+                onPanZoomMainClip = viewModel::setMainClipPanZoom,
+                onRotateOverlay = viewModel::setOverlayRotation,
+                onFlipArrow = { clipId ->
+                    viewModel.selectClip(clipId)
+                    viewModel.flipSelectedHorizontal()
+                },
+                onDoubleTapOverlay = { clipId ->
+                    viewModel.selectClip(clipId)
+                    showEditTextDialog = true
+                },
+                modifier = Modifier.fillMaxSize(),
+            )
+
+            // Small green status text inside the preview canvas
+            toastMsg?.let { msg ->
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xCC061A0E))
+                        .border(1.dp, Color(0xFF00E676), RoundedCornerShape(12.dp))
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                ) {
+                    Text(
+                        text = msg,
+                        color = Color(0xFF00E676),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+        }
 
         PlaybackBar(
             playheadMs = uiState.playheadMs,
@@ -327,31 +350,39 @@ fun EditorScreen(
                 Column(modifier = Modifier.fillMaxWidth()) {
                     val sel = uiState.selectedClip
                     if (sel != null) {
+                        val isOverlayTrack = uiState.timeline.tracks.any { t ->
+                            t.type == TrackType.OVERLAY && t.clips.any { it.id == sel.id }
+                        }
                         SelectedClipBar(
                             onSplit = viewModel::splitAtPlayhead,
                             onDuplicate = viewModel::duplicateSelected,
                             onDelete = viewModel::deleteSelected,
                             onDeselect = { viewModel.selectClip(null) },
-                        )
-                        ContextualExtraStrip(
-                            clip = sel,
-                            isOverlayTrack = uiState.timeline.tracks.any { t ->
-                                t.type == TrackType.OVERLAY && t.clips.any { it.id == sel.id }
-                            },
-                            onToggleLock = viewModel::toggleAudioLockSelected,
-                            onFlipArrow = viewModel::flipSelectedHorizontal,
-                            onToggleKeyframe = viewModel::toggleKeyframeAtPlayhead,
-                            onClipEnd = viewModel::extendOverlayToClipEnd,
-                            onVidEnd = viewModel::extendOverlayToVideoEnd,
-                            onEditText = { showEditTextDialog = true },
-                            onCrop = { viewModel.setActiveTool(EditorTool.CROP) },
-                            onTrimR = viewModel::trimRightToPlayhead,
-                            onCutout = viewModel::toggleCutoutSelected,
+                            showReplace = sel.type == ClipType.VIDEO || sel.type == ClipType.IMAGE,
                             onReplace = {
                                 replaceTargetClipId = sel.id
                                 replacePicker.launch(arrayOf("image/*", "video/*"))
                             },
                         )
+                        val showExtra = sel.type == ClipType.AUDIO ||
+                            isOverlayTrack ||
+                            sel.type == ClipType.TEXT ||
+                            sel.type == ClipType.STICKER
+                        if (showExtra) {
+                            ContextualExtraStrip(
+                                clip = sel,
+                                isOverlayTrack = isOverlayTrack,
+                                onToggleLock = viewModel::toggleAudioLockSelected,
+                                onFlipArrow = viewModel::flipSelectedHorizontal,
+                                onToggleKeyframe = viewModel::toggleKeyframeAtPlayhead,
+                                onClipEnd = viewModel::extendOverlayToClipEnd,
+                                onVidEnd = viewModel::extendOverlayToVideoEnd,
+                                onEditText = { showEditTextDialog = true },
+                                onCrop = { viewModel.setActiveTool(EditorTool.CROP) },
+                                onTrimR = viewModel::trimRightToPlayhead,
+                                onCutout = viewModel::toggleCutoutSelected,
+                            )
+                        }
                     }
                     EditorToolbar(
                         activeTool = uiState.activeTool,
@@ -401,7 +432,6 @@ private fun ContextualExtraStrip(
     onCrop: () -> Unit,
     onTrimR: () -> Unit,
     onCutout: () -> Unit,
-    onReplace: () -> Unit,
 ) {
     val isOverlayOrText = isOverlayTrack || clip.type == ClipType.TEXT || clip.type == ClipType.STICKER
     Row(
@@ -480,14 +510,6 @@ private fun ContextualExtraStrip(
                 onClick = onTrimR,
                 label = { Text("Trim R") },
                 leadingIcon = { Icon(Icons.Filled.ContentCut, null, Modifier.size(16.dp)) },
-            )
-        }
-        if (clip.type == ClipType.VIDEO || clip.type == ClipType.IMAGE) {
-            FilterChip(
-                selected = false,
-                onClick = onReplace,
-                label = { Text("Replace") },
-                leadingIcon = { Icon(Icons.Filled.SwapHoriz, null, Modifier.size(16.dp)) },
             )
         }
     }
@@ -647,7 +669,6 @@ private fun PlaybackBar(
             fontWeight = FontWeight.Bold,
             color = Color(0xFF00E5FF),
         )
-        // Big colourful HD Play/Pause button placed in the former zoom-buttons spot on the right
         Box(
             modifier = Modifier
                 .width(72.dp)
