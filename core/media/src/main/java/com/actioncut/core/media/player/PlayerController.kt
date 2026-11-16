@@ -1,6 +1,9 @@
 package com.actioncut.core.media.player
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
+import android.net.Uri
 import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
@@ -11,25 +14,23 @@ import com.actioncut.core.media.export.EffectMapper
 import com.actioncut.core.model.Clip
 import com.actioncut.core.model.ClipType
 import com.actioncut.core.model.Timeline
+import com.actioncut.core.model.TrackType
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import java.io.File
 import javax.inject.Inject
+import kotlin.math.abs
 
 /**
- * Thin wrapper around an [ExoPlayer] for the editor preview. Builds a sequential preview
- * playlist from the main video lane (each clip trimmed to its source window) and exposes
- * playback as observable [PlaybackState].
- *
- * Not a singleton: one instance per editor screen, released in the ViewModel's onCleared.
- *
- * Preview fidelity note: ExoPlayer applies playback speed globally, so per-clip speed and
- * GPU effects are approximated in preview; the authoritative render happens at export time
- * via [com.actioncut.core.media.export.Media3VideoExporter].
+ * Thin wrapper around an [ExoPlayer] for the editor preview, plus non-blocking
+ * frame capture for the Capture tool.
  */
 class PlayerController @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -39,18 +40,11 @@ class PlayerController @Inject constructor(
         repeatMode = Player.REPEAT_MODE_OFF
     }
 
-    /**
-     * Secondary player for the AUDIO lane (music / extracted audio), mixed alongside the
-     * video preview. Kept time-aligned to [player] (best-effort: assumes audio clips run
-     * from the start of the timeline; arbitrary mid-timeline offsets are approximate).
-     */
     private val audioPlayer: ExoPlayer = ExoPlayer.Builder(context).build().apply {
         playWhenReady = false
         repeatMode = Player.REPEAT_MODE_OFF
     }
 
-    /** Player for picture-in-picture overlay video clips; its surface is rendered by the
-     *  preview. Muted in preview (PiP audio is mixed at export). */
     val pipPlayer: ExoPlayer = ExoPlayer.Builder(context).build().apply {
         playWhenReady = false
         repeatMode = Player.REPEAT_MODE_OFF
@@ -60,19 +54,10 @@ class PlayerController @Inject constructor(
     private val _state = MutableStateFlow(PlaybackState())
     val state: StateFlow<PlaybackState> = _state.asStateFlow()
 
-    /** Per-playlist-item volume (0..1 for ExoPlayer), kept in sync with the timeline. */
     private var clipVolumes: List<Float> = emptyList()
-
-    /** The video-lane clips currently loaded in [player], parallel to its media items. Used to
-     *  compute each clip's live preview effect chain (colour/filter/adjust/crop/rotate). */
     private var previewClips: List<Clip> = emptyList()
-
-    /** Fingerprint of the last-applied preview effect chain, to skip redundant `setVideoEffects`. */
     private var lastPreviewSignature: String? = null
 
-    // Cumulative *timeline* start offset (ms) of each preview item per lane, so we can map
-    // ExoPlayer's per-item position to an absolute timeline position (and back). Without
-    // this the playhead snaps to 0 at every clip boundary (the "jumps back to first" bug).
     private var videoStartsMs: List<Long> = emptyList()
     private var audioStartsMs: List<Long> = emptyList()
     private var pipStartsMs: List<Long> = emptyList()
@@ -92,6 +77,7 @@ class PlayerController @Inject constructor(
         }
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             applyCurrentVolume()
+            applyCurrentClipSpeed()
             applyPreviewEffects()
             pushState()
         }
@@ -106,7 +92,6 @@ class PlayerController @Inject constructor(
         player.addListener(listener)
     }
 
-    /** Rebuilds the preview playlist from [timeline]'s main video lane. */
     fun setTimeline(timeline: Timeline) {
         val clips = previewClips(timeline)
         previewClips = clips
@@ -133,15 +118,14 @@ class PlayerController @Inject constructor(
         player.setMediaItems(items)
         player.prepare()
         applyCurrentVolume()
+        applyCurrentClipSpeed()
         applyPreviewEffects(force = true)
 
-        // Build the audio-lane playlist for the secondary player.
         val audioClips = audioClipsOf(timeline)
         audioStartsMs = cumulativeStarts(audioClips.map { previewDurationMs(it) })
         audioPlayer.setMediaItems(audioClips.map { it.toClippedMediaItem() })
         audioPlayer.prepare()
 
-        // Build the PiP playlist (overlay video clips).
         val pipClips = pipClipsOf(timeline)
         pipStartsMs = cumulativeStarts(pipClips.map { previewDurationMs(it) })
         pipPlayer.setMediaItems(pipClips.map { it.toClippedMediaItem() })
@@ -150,7 +134,6 @@ class PlayerController @Inject constructor(
         pushState()
     }
 
-    /** Preview footprint (ms) of a clip on the timeline — used to map per-item positions. */
     private fun previewDurationMs(clip: Clip): Long = clip.timelineDurationMs.coerceAtLeast(1L)
 
     private fun cumulativeStarts(durations: List<Long>): List<Long> {
@@ -158,14 +141,12 @@ class PlayerController @Inject constructor(
         return durations.map { val start = acc; acc += it; start }
     }
 
-    /** Absolute timeline position (ms) of the master video player across the whole playlist. */
     fun masterPositionMs(): Long {
         if (player.mediaItemCount == 0) return 0L
         val base = videoStartsMs.getOrElse(player.currentMediaItemIndex) { 0L }
         return (base + player.currentPosition.coerceAtLeast(0L)).coerceAtLeast(0L)
     }
 
-    /** Seeks [p] to an absolute timeline position, resolving the right playlist item. */
     private fun seekAbsolute(p: ExoPlayer, starts: List<Long>, absMs: Long) {
         if (p.mediaItemCount == 0) return
         var idx = 0
@@ -195,7 +176,7 @@ class PlayerController @Inject constructor(
 
     private fun pipClipsOf(timeline: Timeline): List<Clip> =
         timeline.tracks
-            .filter { it.type == com.actioncut.core.model.TrackType.OVERLAY }
+            .filter { it.type == TrackType.OVERLAY }
             .flatMap { it.clips }
             .filter { it.mediaUri != null && it.type == ClipType.VIDEO }
             .sortedBy { it.timelineStartMs }
@@ -210,42 +191,34 @@ class PlayerController @Inject constructor(
         }
     }
 
-    /**
-     * Updates preview volume/mute without rebuilding the playlist (used for non-structural
-     * volume edits), so muting a clip is reflected live in the preview.
-     */
     fun updateVolumes(timeline: Timeline) {
         clipVolumes = previewClips(timeline).map { it.volume }
         applyCurrentVolume()
     }
 
-    /**
-     * Refreshes the LIVE preview effect chain (colour / LUT filter / adjustments / stylized GL
-     * effects / crop / rotate) without rebuilding the playlist, so tapping a filter, dragging an
-     * adjustment slider, or toggling an effect is visible in the preview immediately (WYSIWYG).
-     */
     fun refreshPreviewEffects(timeline: Timeline) {
         previewClips = previewClips(timeline)
+        applyCurrentClipSpeed()
         applyPreviewEffects()
     }
 
-    /** Applies the current video clip's preview effects to [player] via `setVideoEffects`. */
+    private fun applyCurrentClipSpeed() {
+        val speed = previewClips.getOrNull(player.currentMediaItemIndex)?.speed?.coerceIn(0.1f, 4f) ?: 1f
+        runCatching {
+            if (player.playbackParameters.speed != speed) {
+                player.playbackParameters = PlaybackParameters(speed)
+            }
+        }
+    }
+
     private fun applyPreviewEffects(force: Boolean = false) {
         val clip = previewClips.getOrNull(player.currentMediaItemIndex)
         val signature = previewEffectSignature(clip)
-        // Skip when the visual effect chain is unchanged (e.g. a volume-only edit), so dragging
-        // the volume slider doesn't trigger a needless GL rebuild + seek nudge on every update.
         if (!force && signature == lastPreviewSignature) return
         lastPreviewSignature = signature
         val effects: List<Effect> = clip?.let { EffectMapper.previewVideoEffects(it) } ?: emptyList()
-        // Guard: GL effect setup can throw on some devices/surfaces; never let it crash preview.
         runCatching {
             player.setVideoEffects(effects)
-            // A paused frame is NOT reprocessed when the effect chain changes, and a seek to the
-            // SAME position is a no-op (consecutive seeks also get coalesced). So do a SINGLE seek
-            // one millisecond away — the same displayed frame, but re-rendered through the new
-            // effect pipeline — making the filter/adjustment visible immediately (WYSIWYG). The
-            // sub-frame playhead drift is imperceptible.
             if (!player.isPlaying && player.playbackState == Player.STATE_READY) {
                 val pos = player.currentPosition.coerceAtLeast(0L)
                 val dur = player.duration.takeIf { it > 0L } ?: (pos + 100L)
@@ -255,10 +228,9 @@ class PlayerController @Inject constructor(
         }
     }
 
-    /** Stable fingerprint of the fields that affect a clip's preview effect chain. */
     private fun previewEffectSignature(clip: Clip?): String = if (clip == null) "" else
-        "${clip.id}|${clip.rotationDegrees}|${clip.transform.rotationDegrees}|" +
-            "${clip.crop}|${clip.adjustments}|${clip.filter}|${clip.effects}"
+        "${clip.id}|${clip.rotationDegrees}|${clip.transform}|${clip.mainAnimation}|" +
+            "${clip.flipHorizontal}|${clip.blurBackground}|${clip.crop}|${clip.adjustments}|${clip.filter}|${clip.effects}"
 
     private fun previewClips(timeline: Timeline): List<Clip> =
         timeline.videoTracks.firstOrNull()?.clips.orEmpty()
@@ -266,7 +238,6 @@ class PlayerController @Inject constructor(
 
     private fun applyCurrentVolume() {
         val index = player.currentMediaItemIndex
-        // ExoPlayer volume is 0..1; clamp (the model allows boost up to 2 for export only).
         player.volume = clipVolumes.getOrElse(index) { 1f }.coerceIn(0f, 1f)
     }
 
@@ -283,8 +254,6 @@ class PlayerController @Inject constructor(
         if (player.isPlaying) {
             player.pause()
         } else {
-            // ExoPlayer's play() does not auto-restart from a finished playlist, so a tap
-            // on play after the preview reaches the end would do nothing — rewind first.
             if (player.playbackState == Player.STATE_ENDED) seekTo(0)
             player.play()
         }
@@ -305,19 +274,38 @@ class PlayerController @Inject constructor(
         pipPlayer.playbackParameters = params
     }
 
-    /** Emits the live *absolute* playhead position while playing (collected on the main thread). */
+    /**
+     * Captures a high-res JPEG frame from [clip] at [playheadMs] without interrupting active playback.
+     */
+    suspend fun captureFrame(clip: Clip, playheadMs: Long): String? = withContext(Dispatchers.IO) {
+        val uri = clip.mediaUri ?: return@withContext null
+        val retriever = MediaMetadataRetriever()
+        runCatching {
+            retriever.setDataSource(context, Uri.parse(uri))
+            val relMs = (playheadMs - clip.timelineStartMs).coerceAtLeast(0L)
+            val sourceUs = (clip.sourceInMs + (relMs * clip.speed).toLong()) * 1_000L
+            val bmp = retriever.getFrameAtTime(sourceUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                ?: retriever.getFrameAtTime(sourceUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: return@runCatching null
+            val outFile = File(context.cacheDir, "capture_${System.currentTimeMillis()}.jpg")
+            outFile.outputStream().use { out ->
+                bmp.compress(Bitmap.CompressFormat.JPEG, 92, out)
+            }
+            bmp.recycle()
+            Uri.fromFile(outFile).toString()
+        }.getOrNull().also { runCatching { retriever.release() } }
+    }
+
     fun positionFlow(intervalMs: Long = 33L): Flow<Long> = flow {
         while (true) {
             val master = masterPositionMs()
-            // Keep the secondary lanes time-aligned with the master, comparing *absolute*
-            // positions so a video clip boundary doesn't yank the audio back to its start.
             if (audioPlayer.isPlaying) {
                 val audioAbs = audioStartsMs.getOrElse(audioPlayer.currentMediaItemIndex) { 0L } + audioPlayer.currentPosition
-                if (kotlin.math.abs(audioAbs - master) > 300) seekAbsolute(audioPlayer, audioStartsMs, master)
+                if (abs(audioAbs - master) > 300) seekAbsolute(audioPlayer, audioStartsMs, master)
             }
             if (pipPlayer.isPlaying) {
                 val pipAbs = pipStartsMs.getOrElse(pipPlayer.currentMediaItemIndex) { 0L } + pipPlayer.currentPosition
-                if (kotlin.math.abs(pipAbs - master) > 300) seekAbsolute(pipPlayer, pipStartsMs, master)
+                if (abs(pipAbs - master) > 300) seekAbsolute(pipPlayer, pipStartsMs, master)
             }
             emit(master)
             delay(intervalMs)
