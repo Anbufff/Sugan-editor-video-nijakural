@@ -141,6 +141,25 @@ class PlayerController @Inject constructor(
         pushState()
     }
 
+    /**
+     * Appends a captured screenshot [Clip] to the end of the playlist WITHOUT re-preparing
+     * or seeking the currently playing video — prevents the black flash on Capture.
+     */
+    fun appendImageSilently(clip: Clip) {
+        val uri = clip.mediaUri ?: return
+        val item = MediaItem.Builder()
+            .setUri(uri)
+            .setImageDurationMs(clip.timelineDurationMs)
+            .build()
+        previewClips = previewClips + clip
+        clipVolumes = clipVolumes + clip.volume
+        val newStart = totalPreviewMs
+        videoStartsMs = videoStartsMs + newStart
+        totalPreviewMs = newStart + previewDurationMs(clip)
+        player.addMediaItem(item)
+        pushState()
+    }
+
     /** Restores preview decoders/surfaces after Home button or screen-off resume. */
     fun restoreAfterResume(timeline: Timeline, positionMs: Long) {
         if (player.playbackState == Player.STATE_IDLE) {
@@ -232,7 +251,6 @@ class PlayerController @Inject constructor(
         val signature = previewEffectSignature(clip)
         if (!force && signature == lastPreviewSignature) return
         lastPreviewSignature = signature
-        // Downscale preview processing to 480p for smooth playback without affecting export quality.
         val effects: List<Effect> = clip?.let {
             if (it.type == ClipType.VIDEO) {
                 listOf(Presentation.createForHeight(480)) + EffectMapper.previewVideoEffects(it)
