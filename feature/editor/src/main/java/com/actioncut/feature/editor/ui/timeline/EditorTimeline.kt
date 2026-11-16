@@ -172,11 +172,11 @@ fun EditorTimeline(
     fun msToPxF(ms: Long): Float = ms / 1000f * pxPerSecond
     fun pxToMs(px: Int): Long = (px / pxPerSecond * 1000f).toLong()
 
+    // User scroll -> seek ONLY when paused (ignores programmatic follow-scroll during playback).
     LaunchedEffect(scrollState, pxPerSecond, durationMs) {
         snapshotFlow { scrollState.value to scrollState.isScrollInProgress }
             .collect { (value, inProgress) ->
-                if (inProgress) {
-                    if (currentIsPlaying) currentOnPause()
+                if (inProgress && !currentIsPlaying) {
                     onScrub(pxToMs(value).coerceIn(0, durationMs))
                 }
             }
@@ -191,7 +191,7 @@ fun EditorTimeline(
     androidx.compose.foundation.layout.BoxWithConstraints(
         modifier = modifier
             .background(MaterialTheme.colorScheme.surface)
-            // Touch anywhere on timeline -> pause immediately without stealing scroll/tap
+            // Actual finger touch on timeline -> immediately pause playback
             .pointerInput(Unit) {
                 awaitPointerEventScope {
                     while (true) {
@@ -435,7 +435,6 @@ private fun ClipBlock(
             },
         contentAlignment = Alignment.CenterStart,
     ) {
-        // Low-res thumbnail backdrop for fast, lightweight visual identification
         thumb?.let { bmp ->
             Image(
                 bitmap = bmp,
