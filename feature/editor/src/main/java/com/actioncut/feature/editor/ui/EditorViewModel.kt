@@ -96,7 +96,6 @@ class EditorViewModel @Inject constructor(
                 _uiState.update { it.copy(isLoading = false) }
                 return@launch
             }
-            // Ensure 16:9 canvas matches preview and export consistently.
             val normalized = if (project.aspectRatio != AspectRatio.RATIO_16_9) {
                 project.copy(aspectRatio = AspectRatio.RATIO_16_9)
             } else {
@@ -143,14 +142,12 @@ class EditorViewModel @Inject constructor(
 
     fun togglePlayPause() = playerController.togglePlayPause()
 
-    /** Pauses playback immediately (e.g. when user touches the main timeline). */
     fun pausePlayback() {
         if (_uiState.value.isPlaying) {
             playerController.pause()
         }
     }
 
-    /** Restores preview state when returning from Home button or screen-off. */
     fun onAppResumed() {
         playerController.restoreAfterResume(_uiState.value.timeline, _uiState.value.playheadMs)
     }
@@ -265,6 +262,10 @@ class EditorViewModel @Inject constructor(
 
     // ------------------------------------------------------------------ HTML Editor Features
 
+    /**
+     * Captures the active video frame WITHOUT interrupting playback or flashing the preview
+     * canvas (appends the screenshot silently via PlayerController.appendImageSilently).
+     */
     fun captureFrameAtPlayhead() {
         val playhead = _uiState.value.playheadMs
         val ac = _uiState.value.timeline.videoTracks.firstOrNull()?.clipAt(playhead)
@@ -275,24 +276,38 @@ class EditorViewModel @Inject constructor(
         viewModelScope.launch {
             val capturedUri = playerController.captureFrame(ac, playhead)
             if (capturedUri == null) {
-                showToast("Video Frame Ready இல்லை, மீண்டும் முயற்சிக்கவும்!")
+                showToast("Video Frame Ready இல்லை!")
                 return@launch
             }
+            val current = _uiState.value.timeline
             val relMs = (playhead - ac.timelineStartMs).coerceAtLeast(0L)
-            mutate(structural = true) { timeline ->
-                val mainTrack = timeline.videoTracks.firstOrNull() ?: return@mutate timeline
-                val marked = TimelineEditor.addCaptureMark(timeline, ac.id, relMs)
-                val photo = Clip(
-                    id = Ids.clip(),
-                    type = ClipType.IMAGE,
-                    mediaUri = capturedUri,
-                    timelineStartMs = 0L,
-                    timelineEndMs = 7_000L,
-                    mainAnimation = MainAnimation.NONE,
+            val marked = TimelineEditor.addCaptureMark(current, ac.id, relMs)
+            val mainTrack = marked.videoTracks.firstOrNull() ?: return@launch
+            val photo = Clip(
+                id = Ids.clip(),
+                type = ClipType.IMAGE,
+                mediaUri = capturedUri,
+                timelineStartMs = 0L,
+                timelineEndMs = 7_000L,
+                mainAnimation = MainAnimation.NONE,
+            )
+            val updated = TimelineEditor.appendClip(marked, mainTrack.id, photo)
+            val placed = updated.videoTracks.firstOrNull()?.clips?.lastOrNull() ?: photo
+
+            undoStack.addLast(current)
+            if (undoStack.size > MAX_UNDO) undoStack.removeFirst()
+            redoStack.clear()
+
+            _uiState.update {
+                it.copy(
+                    timeline = updated,
+                    canUndo = undoStack.isNotEmpty(),
+                    canRedo = false,
                 )
-                TimelineEditor.appendClip(marked, mainTrack.id, photo)
             }
-            showToast("Frame Capture செய்யப்பட்டது!")
+            playerController.appendImageSilently(placed)
+            scheduleSave()
+            showToast("Screenshot சேமிக்கப்பட்டது!")
         }
     }
 
@@ -305,7 +320,7 @@ class EditorViewModel @Inject constructor(
         mutate(structural = true) { TimelineEditor.deleteAllVideosKeepImages(it) }
         _uiState.update { it.copy(selectedClipId = it.timeline.allClips.firstOrNull()?.id) }
         seekTo(0L)
-        showToast("அனைத்து Videoகளும் நீக்கப்பட்டன! Screenshots மட்டும் உள்ளது")
+        showToast("Videos நீக்கப்பட்டன! Screenshots மட்டும் உள்ளது")
     }
 
     fun setDurationSingle(durationMs: Long) {
