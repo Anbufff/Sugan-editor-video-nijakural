@@ -1,8 +1,17 @@
 package com.actioncut.feature.editor.ui.timeline
 
+import android.content.Context
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.util.LruCache
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
@@ -11,6 +20,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -37,15 +47,22 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -60,16 +77,66 @@ import com.actioncut.core.model.Timeline
 import com.actioncut.core.model.Track
 import com.actioncut.core.model.TrackType
 import com.actioncut.core.model.TransitionType
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 private const val TRACK_HEIGHT = 52
 private const val RULER_HEIGHT = 22
 private const val HANDLE_WIDTH = 14
 
+/** Tiny ultra-low-res thumbnail cache for smooth timeline scrolling without memory pressure. */
+private object TimelineThumbCache {
+    private val cache = LruCache<String, ImageBitmap>(40)
+
+    fun get(uri: String): ImageBitmap? = cache.get(uri)
+
+    fun loadTiny(context: Context, uri: String, isVideo: Boolean): ImageBitmap? {
+        cache.get(uri)?.let { return it }
+        return runCatching {
+            val parsed = Uri.parse(uri)
+            val bmp = if (isVideo) {
+                val r = MediaMetadataRetriever()
+                try {
+                    r.setDataSource(context, parsed)
+                    val frame = r.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        ?: return@runCatching null
+                    val scale = 96f / max(frame.width, frame.height).coerceAtLeast(1)
+                    if (scale < 1f) {
+                        android.graphics.Bitmap.createScaledBitmap(
+                            frame,
+                            (frame.width * scale).roundToInt().coerceAtLeast(16),
+                            (frame.height * scale).roundToInt().coerceAtLeast(16),
+                            true,
+                        ).also { frame.recycle() }
+                    } else frame
+                } finally {
+                    runCatching { r.release() }
+                }
+            } else {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                context.contentResolver.openInputStream(parsed)?.use {
+                    BitmapFactory.decodeStream(it, null, bounds)
+                }
+                var sample = 1
+                val longest = max(bounds.outWidth, bounds.outHeight)
+                while (longest / sample > 128) sample *= 2
+                context.contentResolver.openInputStream(parsed)?.use {
+                    BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+                }
+            } ?: return@runCatching null
+            val img = bmp.asImageBitmap()
+            cache.put(uri, img)
+            img
+        }.getOrNull()
+    }
+}
+
 /**
- * CapCut-style timeline with transition diamond boxes, yellow capture marks,
- * audio lock badges, and keyframe diamonds.
+ * CapCut-style timeline with low-res smooth thumbnails, touch-to-pause,
+ * 2-finger pinch-to-zoom, transition diamonds, capture marks, lock badges & keyframes.
  */
 @Composable
 fun EditorTimeline(
@@ -89,11 +156,18 @@ fun EditorTimeline(
     onTransitionClick: (String) -> Unit = {},
     onLongPressClip: (String) -> Unit = {},
     onSelectKeyframe: (Long) -> Unit = {},
+    onPausePlayback: () -> Unit = {},
+    onZoomChange: (Float) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
     val scrollState = rememberScrollState()
     val layoutDurationMs = durationMs.coerceAtLeast(2_000)
+
+    val currentPxPerSec by rememberUpdatedState(pxPerSecond)
+    val currentIsPlaying by rememberUpdatedState(isPlaying)
+    val currentOnPause by rememberUpdatedState(onPausePlayback)
+    val currentOnZoom by rememberUpdatedState(onZoomChange)
 
     fun msToPxF(ms: Long): Float = ms / 1000f * pxPerSecond
     fun pxToMs(px: Int): Long = (px / pxPerSecond * 1000f).toLong()
@@ -101,7 +175,10 @@ fun EditorTimeline(
     LaunchedEffect(scrollState, pxPerSecond, durationMs) {
         snapshotFlow { scrollState.value to scrollState.isScrollInProgress }
             .collect { (value, inProgress) ->
-                if (inProgress && !isPlaying) onScrub(pxToMs(value).coerceIn(0, durationMs))
+                if (inProgress) {
+                    if (currentIsPlaying) currentOnPause()
+                    onScrub(pxToMs(value).coerceIn(0, durationMs))
+                }
             }
     }
     LaunchedEffect(playheadMs, isPlaying) {
@@ -112,7 +189,35 @@ fun EditorTimeline(
     }
 
     androidx.compose.foundation.layout.BoxWithConstraints(
-        modifier = modifier.background(MaterialTheme.colorScheme.surface),
+        modifier = modifier
+            .background(MaterialTheme.colorScheme.surface)
+            // Touch anywhere on timeline -> pause immediately without stealing scroll/tap
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val ev = awaitPointerEvent(PointerEventPass.Initial)
+                        if (ev.changes.any { it.pressed } && currentIsPlaying) {
+                            currentOnPause()
+                        }
+                    }
+                }
+            }
+            // Two-finger pinch-to-zoom on timeline (leaves 1-finger horizontal scroll untouched)
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    do {
+                        val event = awaitPointerEvent()
+                        if (event.changes.count { it.pressed } >= 2) {
+                            val zoom = event.calculateZoom()
+                            if (zoom != 1f && abs(zoom - 1f) > 0.005f) {
+                                currentOnZoom(currentPxPerSec * zoom)
+                                event.changes.forEach { it.consume() }
+                            }
+                        }
+                    } while (event.changes.any { it.pressed })
+                }
+            },
     ) {
         val viewportPx = constraints.maxWidth
         val halfViewportDp = with(density) { (viewportPx / 2).toDp() }
@@ -236,7 +341,6 @@ private fun TrackLane(
             }
         }
 
-        // Transition diamond badges between adjacent main video clips
         if (track.type == TrackType.VIDEO && track.clips.size > 1) {
             for (i in 0 until track.clips.lastIndex) {
                 val clip = track.clips[i]
@@ -281,11 +385,25 @@ private fun ClipBlock(
     onLongPressClip: (String) -> Unit = {},
     onSelectKeyframe: (Long) -> Unit = {},
 ) {
+    val context = LocalContext.current
     val density = LocalDensity.current
     val widthDp = with(density) { (clip.timelineDurationMs / 1000f * pxPerSecond).toDp() }
     val borderColor = if (selected) MaterialTheme.colorScheme.primary else Color.Transparent
     var moveAnchor by remember(clip.id) { mutableLongStateOf(clip.timelineStartMs) }
     var moveAcc by remember(clip.id) { mutableFloatStateOf(0f) }
+
+    var thumb by remember(clip.mediaUri) {
+        mutableStateOf(clip.mediaUri?.let { TimelineThumbCache.get(it) })
+    }
+    if ((clip.type == ClipType.VIDEO || clip.type == ClipType.IMAGE) && clip.mediaUri != null) {
+        LaunchedEffect(clip.mediaUri) {
+            if (thumb == null) {
+                thumb = withContext(Dispatchers.IO) {
+                    TimelineThumbCache.loadTiny(context, clip.mediaUri!!, clip.type == ClipType.VIDEO)
+                }
+            }
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -317,6 +435,18 @@ private fun ClipBlock(
             },
         contentAlignment = Alignment.CenterStart,
     ) {
+        // Low-res thumbnail backdrop for fast, lightweight visual identification
+        thumb?.let { bmp ->
+            Image(
+                bitmap = bmp,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .alpha(0.50f),
+            )
+        }
+
         if (clip.type == ClipType.AUDIO && clip.mediaUri != null && onLoadWaveform != null) {
             AudioWaveform(
                 uri = clip.mediaUri!!,
@@ -325,7 +455,6 @@ private fun ClipBlock(
             )
         }
 
-        // Yellow screenshot capture marks on video clips
         if (clip.captureMarksMs.isNotEmpty()) {
             Canvas(modifier = Modifier.matchParentSize()) {
                 clip.captureMarksMs.forEach { relMs ->
@@ -346,7 +475,10 @@ private fun ClipBlock(
         }
 
         Row(
-            modifier = Modifier.padding(horizontal = 8.dp),
+            modifier = Modifier
+                .padding(horizontal = 8.dp)
+                .background(Color.Black.copy(alpha = if (thumb != null) 0.45f else 0f), RoundedCornerShape(4.dp))
+                .padding(horizontal = if (thumb != null) 4.dp else 0.dp, vertical = 1.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
@@ -374,7 +506,6 @@ private fun ClipBlock(
             }
         }
 
-        // Keyframe diamonds
         clip.keyframes.forEach { kf ->
             val kfX = with(density) { (kf.timeMs / 1000f * pxPerSecond).toDp() }
             val isNear = abs(playheadMs - (clip.timelineStartMs + kf.timeMs)) < 200L
