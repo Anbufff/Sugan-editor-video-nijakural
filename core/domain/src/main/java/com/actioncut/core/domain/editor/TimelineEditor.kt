@@ -5,26 +5,21 @@ import com.actioncut.core.model.Clip
 import com.actioncut.core.model.ClipType
 import com.actioncut.core.model.ColorAdjustments
 import com.actioncut.core.model.Filter
+import com.actioncut.core.model.MainAnimation
+import com.actioncut.core.model.SpeedPresets
 import com.actioncut.core.model.Timeline
 import com.actioncut.core.model.Track
 import com.actioncut.core.model.TrackType
 import com.actioncut.core.model.Transform
 import com.actioncut.core.model.Transition
+import com.actioncut.core.model.TransitionType
 import com.actioncut.core.model.VisualEffect
-import com.actioncut.core.model.SpeedPresets
 import java.util.UUID
 
 /**
  * Pure, side-effect-free editing engine. Every operation takes an immutable [Timeline]
  * and returns a new one, which makes the whole thing trivially unit-testable and a
  * perfect fit for an undo/redo stack in the ViewModel.
- *
- * Two time spaces are reconciled here (see [Clip]):
- *  - **timeline** space (where the clip sits on the canvas)
- *  - **source** space (the trimmed window inside the original media)
- *
- * They relate through [Clip.speed]: `timelineDuration = sourceDuration / speed`.
- * [Clip.isReversed] flips the source mapping (high source value first).
  */
 object TimelineEditor {
 
@@ -35,7 +30,6 @@ object TimelineEditor {
     // Track operations
     // ---------------------------------------------------------------------------------
 
-    /** Adds an empty track of [type]; returns the new timeline and the new track id. */
     fun addTrack(timeline: Timeline, type: TrackType): Pair<Timeline, String> {
         val id = "trk_${UUID.randomUUID().toString().take(8)}"
         val track = Track(id = id, type = type, index = timeline.tracks.size)
@@ -49,10 +43,6 @@ object TimelineEditor {
     // Structural clip operations
     // ---------------------------------------------------------------------------------
 
-    /**
-     * Appends [clip] to the end of [trackId], preserving the clip's duration but moving
-     * it to start exactly where the track currently ends (contiguous CapCut main lane).
-     */
     fun appendClip(timeline: Timeline, trackId: String, clip: Clip): Timeline {
         val track = timeline.track(trackId) ?: return timeline
         val start = track.durationMs
@@ -63,11 +53,9 @@ object TimelineEditor {
         return mapTrack(timeline, trackId) { it.copy(clips = it.clips + placed) }
     }
 
-    /** Adds [clip] to [trackId] at its own position (no ripple), keeping the lane sorted. */
     fun addClip(timeline: Timeline, trackId: String, clip: Clip): Timeline =
         mapTrack(timeline, trackId) { t -> t.copy(clips = (t.clips + clip).sortedBy { it.timelineStartMs }) }
 
-    /** Inserts [clip] at its own [Clip.timelineStartMs]; later clips ripple right. */
     fun insertClip(timeline: Timeline, trackId: String, clip: Clip): Timeline {
         return mapTrack(timeline, trackId) { track ->
             val shifted = track.clips.map { existing ->
@@ -81,10 +69,6 @@ object TimelineEditor {
         }
     }
 
-    /**
-     * Removes [clipId]. When [ripple] is true, every later clip on the same track shifts
-     * left to close the gap (default behaviour for the main lane).
-     */
     fun removeClip(timeline: Timeline, clipId: String, ripple: Boolean = true): Timeline {
         val located = findClip(timeline, clipId) ?: return timeline
         val (track, clip) = located
@@ -105,10 +89,6 @@ object TimelineEditor {
         }
     }
 
-    /**
-     * Splits the clip containing [atTimelineMs] into two adjacent clips. No-op if the cut
-     * falls within [MIN_CLIP_DURATION_MS] of either edge.
-     */
     fun splitClip(timeline: Timeline, clipId: String, atTimelineMs: Long): Timeline {
         val located = findClip(timeline, clipId) ?: return timeline
         val (track, clip) = located
@@ -147,7 +127,6 @@ object TimelineEditor {
                 )
             }
         } else {
-            // Image / text / sticker: no source window, just split the timeline span.
             first = clip.copy(id = newClipId(), timelineEndMs = atTimelineMs, transitionToNext = null)
             second = clip.copy(id = newClipId(), timelineStartMs = atTimelineMs)
         }
@@ -157,9 +136,9 @@ object TimelineEditor {
         }
     }
 
-    /** Drags the left edge to [newStartMs], adjusting the trimmed source window. */
     fun trimClipStart(timeline: Timeline, clipId: String, newStartMs: Long): Timeline {
         val (_, clip) = findClip(timeline, clipId) ?: return timeline
+        if (clip.isLocked) return timeline
         val clamped = newStartMs.coerceIn(
             (clip.timelineStartMs - headRoom(clip)),
             clip.timelineEndMs - MIN_CLIP_DURATION_MS,
@@ -177,9 +156,9 @@ object TimelineEditor {
         }
     }
 
-    /** Drags the right edge to [newEndMs], adjusting the trimmed source window. */
     fun trimClipEnd(timeline: Timeline, clipId: String, newEndMs: Long): Timeline {
         val (_, clip) = findClip(timeline, clipId) ?: return timeline
+        if (clip.isLocked) return timeline
         val clamped = newEndMs.coerceIn(
             clip.timelineStartMs + MIN_CLIP_DURATION_MS,
             clip.timelineEndMs + tailRoom(clip),
@@ -197,7 +176,22 @@ object TimelineEditor {
         }
     }
 
-    /** Moves a clip to [targetTrackId] starting at [newStartMs] (free positioning). */
+    /** Trims the right edge of [clipId] to [atTimelineMs] and ripples main-track clips left. */
+    fun trimEndTo(timeline: Timeline, clipId: String, atTimelineMs: Long): Timeline {
+        val (track, clip) = findClip(timeline, clipId) ?: return timeline
+        if (clip.isLocked) return timeline
+        if (atTimelineMs <= clip.timelineStartMs + MIN_CLIP_DURATION_MS || atTimelineMs >= clip.timelineEndMs) {
+            return timeline
+        }
+        val oldEnd = clip.timelineEndMs
+        val trimmed = trimClipEnd(timeline, clipId, atTimelineMs)
+        if (track.type != TrackType.VIDEO) return trimmed
+        val shift = atTimelineMs - oldEnd
+        return mapTrack(trimmed, track.id) { t ->
+            t.copy(clips = t.clips.map { c -> if (c.id != clipId && c.timelineStartMs >= oldEnd) c.shiftedBy(shift) else c })
+        }
+    }
+
     fun moveClip(
         timeline: Timeline,
         clipId: String,
@@ -205,6 +199,7 @@ object TimelineEditor {
         newStartMs: Long,
     ): Timeline {
         val (sourceTrack, clip) = findClip(timeline, clipId) ?: return timeline
+        if (clip.isLocked) return timeline
         if (timeline.track(targetTrackId) == null) return timeline
         val start = newStartMs.coerceAtLeast(0)
         val moved = clip.copy(
@@ -220,14 +215,9 @@ object TimelineEditor {
     }
 
     // ---------------------------------------------------------------------------------
-    // Audio
+    // Audio & Capture / HTML Editor features
     // ---------------------------------------------------------------------------------
 
-    /**
-     * Extracts (detaches) the audio of a video clip into a separate audio clip on an AUDIO
-     * lane, aligned to the same timeline position, and mutes the original video clip so the
-     * audio isn't doubled. CapCut/InShot-style "Extract audio".
-     */
     fun detachAudio(timeline: Timeline, clipId: String): Timeline {
         val located = findClip(timeline, clipId) ?: return timeline
         val (_, clip) = located
@@ -246,7 +236,6 @@ object TimelineEditor {
             volume = if (clip.volume <= 0f) 1f else clip.volume,
         )
 
-        // Mute the original video clip's audio (it now lives on the audio lane).
         val muted = updateClip(timeline, clipId) { it.copy(volume = 0f) }
 
         val audioTrack = muted.tracks.firstOrNull { it.type == TrackType.AUDIO }
@@ -260,11 +249,117 @@ object TimelineEditor {
         }
     }
 
+    fun setAudioLocked(timeline: Timeline, clipId: String, locked: Boolean): Timeline =
+        updateClip(timeline, clipId) { it.copy(isLocked = locked) }
+
+    fun addCaptureMark(timeline: Timeline, clipId: String, relativeMs: Long): Timeline =
+        updateClip(timeline, clipId) { c ->
+            c.copy(captureMarksMs = (c.captureMarksMs + relativeMs.coerceAtLeast(0L)).distinct().sorted())
+        }
+
+    /** Removes all VIDEO clips from main video lanes and packs remaining IMAGE screenshots contiguously. */
+    fun deleteAllVideosKeepImages(timeline: Timeline): Timeline {
+        val mainVideoIds = timeline.videoTracks.map { it.id }.toSet()
+        return timeline.copy(
+            tracks = timeline.tracks.map { track ->
+                if (track.id !in mainVideoIds) {
+                    track
+                } else {
+                    var cursor = 0L
+                    val kept = track.clips
+                        .filter { it.type != ClipType.VIDEO }
+                        .map { clip ->
+                            val dur = clip.timelineDurationMs.coerceAtLeast(MIN_CLIP_DURATION_MS)
+                            val placed = clip.copy(
+                                timelineStartMs = cursor,
+                                timelineEndMs = cursor + dur,
+                                transitionToNext = null,
+                            )
+                            cursor += dur
+                            placed
+                        }
+                    track.copy(clips = kept)
+                }
+            },
+        )
+    }
+
+    fun setDuration(timeline: Timeline, clipId: String, durationMs: Long, ripple: Boolean = true): Timeline {
+        val (track, clip) = findClip(timeline, clipId) ?: return timeline
+        val safeDur = durationMs.coerceAtLeast(MIN_CLIP_DURATION_MS)
+        val delta = safeDur - clip.timelineDurationMs
+        if (delta == 0L) return timeline
+        val oldEnd = clip.timelineEndMs
+        val updated = updateClip(timeline, clipId) { c ->
+            c.copy(timelineEndMs = c.timelineStartMs + safeDur)
+        }
+        if (!ripple || track.type != TrackType.VIDEO) return updated
+        return mapTrack(updated, track.id) { t ->
+            t.copy(clips = t.clips.map { c -> if (c.id != clipId && c.timelineStartMs >= oldEnd) c.shiftedBy(delta) else c })
+        }
+    }
+
+    fun setDurationAll(timeline: Timeline, durationMs: Long): Timeline {
+        val mainTrack = timeline.videoTracks.firstOrNull() ?: return timeline
+        val safeDur = durationMs.coerceAtLeast(MIN_CLIP_DURATION_MS)
+        var cursor = 0L
+        val packed = mainTrack.clips.map { clip ->
+            val placed = clip.copy(timelineStartMs = cursor, timelineEndMs = cursor + safeDur)
+            cursor += safeDur
+            placed
+        }
+        return mapTrack(timeline, mainTrack.id) { it.copy(clips = packed) }
+    }
+
+    fun setSpeedKeepDuration(timeline: Timeline, clipId: String, speed: Float): Timeline {
+        val s = speed.coerceIn(SpeedPresets.MIN, SpeedPresets.MAX)
+        return updateClip(timeline, clipId) { it.copy(speed = s) }
+    }
+
+    fun setSpeedKeepDurationAll(timeline: Timeline, speed: Float): Timeline {
+        val s = speed.coerceIn(SpeedPresets.MIN, SpeedPresets.MAX)
+        val mainTrack = timeline.videoTracks.firstOrNull() ?: return timeline
+        return mapTrack(timeline, mainTrack.id) { t ->
+            t.copy(clips = t.clips.map { c -> if (c.type == ClipType.VIDEO) c.copy(speed = s) else c })
+        }
+    }
+
+    fun extendOverlayToClipEnd(timeline: Timeline, clipId: String): Timeline {
+        val (_, clip) = findClip(timeline, clipId) ?: return timeline
+        val mainTrack = timeline.videoTracks.firstOrNull() ?: return timeline
+        val host = mainTrack.clipAt(clip.timelineStartMs)
+            ?: mainTrack.clips.firstOrNull { it.timelineEndMs > clip.timelineStartMs }
+            ?: return timeline
+        if (host.timelineEndMs <= clip.timelineStartMs) return timeline
+        return updateClip(timeline, clipId) { it.copy(timelineEndMs = host.timelineEndMs) }
+    }
+
+    fun extendOverlayToVideoEnd(timeline: Timeline, clipId: String): Timeline {
+        val (_, clip) = findClip(timeline, clipId) ?: return timeline
+        val totalEnd = timeline.videoTracks.firstOrNull()?.durationMs ?: return timeline
+        if (totalEnd <= clip.timelineStartMs) return timeline
+        return updateClip(timeline, clipId) { it.copy(timelineEndMs = totalEnd) }
+    }
+
+    fun replaceClipMedia(
+        timeline: Timeline,
+        clipId: String,
+        newUri: String,
+        newType: ClipType,
+        newSourceDurationMs: Long,
+    ): Timeline = updateClip(timeline, clipId) { c ->
+        if (newType == ClipType.IMAGE) {
+            c.copy(type = ClipType.IMAGE, mediaUri = newUri, sourceInMs = 0L, sourceOutMs = 0L, captureMarksMs = emptyList())
+        } else {
+            val dur = newSourceDurationMs.coerceAtLeast(MIN_CLIP_DURATION_MS)
+            c.copy(type = newType, mediaUri = newUri, sourceInMs = 0L, sourceOutMs = dur, timelineEndMs = c.timelineStartMs + dur, captureMarksMs = emptyList())
+        }
+    }
+
     // ---------------------------------------------------------------------------------
     // Property updates
     // ---------------------------------------------------------------------------------
 
-    /** Generic copy-on-write update for a single clip. */
     fun updateClip(timeline: Timeline, clipId: String, transform: (Clip) -> Clip): Timeline =
         timeline.copy(
             tracks = timeline.tracks.map { track ->
@@ -276,10 +371,6 @@ object TimelineEditor {
             },
         )
 
-    /**
-     * Changes playback speed, recomputing the timeline length from the fixed source
-     * window. Only applies to media with a real source timeline (video/audio).
-     */
     fun setSpeed(timeline: Timeline, clipId: String, speed: Float): Timeline {
         val s = speed.coerceIn(SpeedPresets.MIN, SpeedPresets.MAX)
         return updateClip(timeline, clipId) { c ->
@@ -319,6 +410,52 @@ object TimelineEditor {
     fun setTransition(timeline: Timeline, clipId: String, transition: Transition?): Timeline =
         updateClip(timeline, clipId) { it.copy(transitionToNext = transition) }
 
+    fun setTransitionAll(timeline: Timeline, transition: Transition?): Timeline {
+        val mainTrack = timeline.videoTracks.firstOrNull() ?: return timeline
+        return mapTrack(timeline, mainTrack.id) { t ->
+            t.copy(clips = t.clips.mapIndexed { idx, c ->
+                if (idx < t.clips.lastIndex) c.copy(transitionToNext = transition) else c
+            })
+        }
+    }
+
+    fun setTransitionsRandom(timeline: Timeline, pool: List<TransitionType>): Timeline {
+        if (pool.isEmpty()) return timeline
+        val mainTrack = timeline.videoTracks.firstOrNull() ?: return timeline
+        return mapTrack(timeline, mainTrack.id) { t ->
+            t.copy(clips = t.clips.mapIndexed { idx, c ->
+                if (idx < t.clips.lastIndex) c.copy(transitionToNext = Transition(pool.random())) else c
+            })
+        }
+    }
+
+    fun setMainAnimation(timeline: Timeline, clipId: String, animation: MainAnimation): Timeline =
+        updateClip(timeline, clipId) { it.copy(mainAnimation = animation) }
+
+    fun setMainAnimationAll(timeline: Timeline, animation: MainAnimation): Timeline {
+        val mainTrack = timeline.videoTracks.firstOrNull() ?: return timeline
+        return mapTrack(timeline, mainTrack.id) { t ->
+            t.copy(clips = t.clips.map { it.copy(mainAnimation = animation) })
+        }
+    }
+
+    fun setMainAnimationRandom(timeline: Timeline, pool: List<MainAnimation>): Timeline {
+        if (pool.isEmpty()) return timeline
+        val mainTrack = timeline.videoTracks.firstOrNull() ?: return timeline
+        return mapTrack(timeline, mainTrack.id) { t ->
+            t.copy(clips = t.clips.map { it.copy(mainAnimation = pool.random()) })
+        }
+    }
+
+    fun setFlipHorizontal(timeline: Timeline, clipId: String, flipped: Boolean): Timeline =
+        updateClip(timeline, clipId) { it.copy(flipHorizontal = flipped) }
+
+    fun setCutout(timeline: Timeline, clipId: String, enabled: Boolean): Timeline =
+        updateClip(timeline, clipId) { it.copy(cutoutEnabled = enabled) }
+
+    fun setCropPan(timeline: Timeline, clipId: String, panX: Float, panY: Float): Timeline =
+        updateClip(timeline, clipId) { it.copy(cropPanX = panX.coerceIn(0f, 1f), cropPanY = panY.coerceIn(0f, 1f)) }
+
     fun addEffect(timeline: Timeline, clipId: String, effect: VisualEffect): Timeline =
         updateClip(timeline, clipId) { it.copy(effects = it.effects + effect) }
 
@@ -331,7 +468,6 @@ object TimelineEditor {
     // Lookup helpers
     // ---------------------------------------------------------------------------------
 
-    /** Finds a clip and its owning track. */
     fun findClip(timeline: Timeline, clipId: String): Pair<Track, Clip>? {
         for (track in timeline.tracks) {
             val clip = track.clips.firstOrNull { it.id == clipId }
@@ -349,23 +485,19 @@ object TimelineEditor {
     private fun mapTrack(timeline: Timeline, trackId: String, transform: (Track) -> Track): Timeline =
         timeline.copy(tracks = timeline.tracks.map { if (it.id == trackId) transform(it) else it })
 
-    /** Source position for a timeline offset within a clip, honouring speed + reverse. */
     private fun sourceAt(clip: Clip, offsetTimelineMs: Long): Long {
         val sourceOffset = (offsetTimelineMs * clip.speed).toLong()
         return if (clip.isReversed) clip.sourceOutMs - sourceOffset else clip.sourceInMs + sourceOffset
     }
 
-    /** How far the left edge can extend left (extra source available before sourceIn). */
     private fun headRoom(clip: Clip): Long {
-        if (!clip.hasSourceWindow) return clip.timelineStartMs // images can slide to 0
+        if (!clip.hasSourceWindow) return clip.timelineStartMs
         val availableSource = if (clip.isReversed) Long.MAX_VALUE else clip.sourceInMs
         return (availableSource / clip.speed).toLong().coerceAtMost(clip.timelineStartMs)
     }
 
-    /** How far the right edge can extend right (extra trailing source after sourceOut). */
     private fun tailRoom(clip: Clip): Long {
         if (!clip.hasSourceWindow) return Long.MAX_VALUE / 2
-        // Without knowing total media length we allow extension up to an extra source window.
         return (clip.sourceDurationMs / clip.speed).toLong()
     }
 
