@@ -8,6 +8,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -41,8 +43,6 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material.icons.filled.ZoomIn
-import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -52,6 +52,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,12 +61,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.actioncut.core.common.time.TimeFormatter
 import com.actioncut.core.designsystem.component.PrimaryButton
@@ -96,6 +103,20 @@ fun EditorScreen(
     var replaceTargetClipId by remember { mutableStateOf<String?>(null) }
 
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    // Persist on Home/Screen-Off & restore decoders cleanly when returning
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> viewModel.saveNow()
+                Lifecycle.Event.ON_RESUME -> viewModel.onAppResumed()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     var toolbarTools by remember {
         mutableStateOf(loadToolbarOrder(context))
@@ -224,8 +245,6 @@ fun EditorScreen(
             durationMs = uiState.durationMs,
             isPlaying = uiState.isPlaying,
             onTogglePlay = viewModel::togglePlayPause,
-            onZoomIn = { viewModel.setZoom(uiState.pxPerSecond * 1.4f) },
-            onZoomOut = { viewModel.setZoom(uiState.pxPerSecond / 1.4f) },
         )
 
         EditorTimeline(
@@ -251,6 +270,8 @@ fun EditorScreen(
                 replacePicker.launch(arrayOf("image/*", "video/*"))
             },
             onSelectKeyframe = { kfTimeMs -> viewModel.seekTo(kfTimeMs) },
+            onPausePlayback = viewModel::pausePlayback,
+            onZoomChange = viewModel::setZoom,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(120.dp),
@@ -604,35 +625,46 @@ private fun PlaybackBar(
     durationMs: Long,
     isPlaying: Boolean,
     onTogglePlay: () -> Unit,
-    onZoomIn: () -> Unit,
-    onZoomOut: () -> Unit,
 ) {
     val haptic = rememberHaptic()
+    val colourfulGradient = Brush.linearGradient(
+        listOf(
+            Color(0xFFFF2E4D),
+            Color(0xFFFF8C42),
+            Color(0xFF00E5FF),
+        ),
+    )
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp),
+            .padding(horizontal = 16.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        IconButton(onClick = { haptic.click(); onTogglePlay() }) {
+        Text(
+            text = "${TimeFormatter.precise(playheadMs)} / ${TimeFormatter.clock(durationMs)}",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Bold,
+            color = Color(0xFF00E5FF),
+        )
+        // Big colourful HD Play/Pause button placed in the former zoom-buttons spot on the right
+        Box(
+            modifier = Modifier
+                .width(72.dp)
+                .height(44.dp)
+                .shadow(10.dp, RoundedCornerShape(22.dp), spotColor = Color(0xFFFF2E4D))
+                .clip(RoundedCornerShape(22.dp))
+                .background(colourfulGradient)
+                .border(1.5.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(22.dp))
+                .clickable { haptic.click(); onTogglePlay() },
+            contentAlignment = Alignment.Center,
+        ) {
             Icon(
                 imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                 contentDescription = if (isPlaying) "Pause" else "Play",
-                tint = MaterialTheme.colorScheme.onBackground,
+                tint = Color.White,
+                modifier = Modifier.size(30.dp),
             )
-        }
-        Text(
-            text = "${TimeFormatter.precise(playheadMs)} / ${TimeFormatter.clock(durationMs)}",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.weight(1f),
-        )
-        IconButton(onClick = onZoomOut) {
-            Icon(Icons.Filled.ZoomOut, contentDescription = "Zoom out", modifier = Modifier.size(20.dp))
-        }
-        IconButton(onClick = onZoomIn) {
-            Icon(Icons.Filled.ZoomIn, contentDescription = "Zoom in", modifier = Modifier.size(20.dp))
         }
     }
 }
