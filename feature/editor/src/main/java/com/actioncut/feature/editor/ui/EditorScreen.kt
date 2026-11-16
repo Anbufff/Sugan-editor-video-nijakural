@@ -242,7 +242,6 @@ fun EditorScreen(
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // Small green status text inside the preview canvas
             toastMsg?.let { msg ->
                 Box(
                     modifier = Modifier
@@ -363,6 +362,7 @@ fun EditorScreen(
                                 replaceTargetClipId = sel.id
                                 replacePicker.launch(arrayOf("image/*", "video/*"))
                             },
+                            onCapture = viewModel::captureFrameAtPlayhead,
                         )
                         val showExtra = sel.type == ClipType.AUDIO ||
                             isOverlayTrack ||
