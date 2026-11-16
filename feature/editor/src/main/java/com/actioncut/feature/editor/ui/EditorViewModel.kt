@@ -14,6 +14,7 @@ import com.actioncut.core.media.audio.VoiceRecorder
 import com.actioncut.core.media.player.PlayerController
 import com.actioncut.core.media.waveform.WaveformExtractor
 import com.actioncut.core.model.AnimationGroup
+import com.actioncut.core.model.AspectRatio
 import com.actioncut.core.model.CanvasSettings
 import com.actioncut.core.model.Clip
 import com.actioncut.core.model.ClipType
@@ -95,18 +96,24 @@ class EditorViewModel @Inject constructor(
                 _uiState.update { it.copy(isLoading = false) }
                 return@launch
             }
-            loadedProject = project
+            // Ensure 16:9 canvas matches preview and export consistently.
+            val normalized = if (project.aspectRatio != AspectRatio.RATIO_16_9) {
+                project.copy(aspectRatio = AspectRatio.RATIO_16_9)
+            } else {
+                project
+            }
+            loadedProject = normalized
             _uiState.update {
                 it.copy(
                     isLoading = false,
-                    projectName = project.name,
-                    timeline = project.timeline,
-                    aspectRatio = project.aspectRatio,
-                    canvas = project.canvas,
-                    selectedClipId = project.timeline.allClips.firstOrNull()?.id,
+                    projectName = normalized.name,
+                    timeline = normalized.timeline,
+                    aspectRatio = AspectRatio.RATIO_16_9,
+                    canvas = normalized.canvas,
+                    selectedClipId = normalized.timeline.allClips.firstOrNull()?.id,
                 )
             }
-            playerController.setTimeline(project.timeline)
+            playerController.setTimeline(normalized.timeline)
         }
     }
 
@@ -132,9 +139,21 @@ class EditorViewModel @Inject constructor(
         }
     }
 
-    // ------------------------------------------------------------------ playback
+    // ------------------------------------------------------------------ playback / lifecycle
 
     fun togglePlayPause() = playerController.togglePlayPause()
+
+    /** Pauses playback immediately (e.g. when user touches the main timeline). */
+    fun pausePlayback() {
+        if (_uiState.value.isPlaying) {
+            playerController.pause()
+        }
+    }
+
+    /** Restores preview state when returning from Home button or screen-off. */
+    fun onAppResumed() {
+        playerController.restoreAfterResume(_uiState.value.timeline, _uiState.value.playheadMs)
+    }
 
     fun seekTo(positionMs: Long) {
         val clamped = positionMs.coerceIn(0, _uiState.value.durationMs)
@@ -246,7 +265,6 @@ class EditorViewModel @Inject constructor(
 
     // ------------------------------------------------------------------ HTML Editor Features
 
-    /** Captures the active video frame without stopping playback, marks the video clip, and appends screenshot. */
     fun captureFrameAtPlayhead() {
         val playhead = _uiState.value.playheadMs
         val ac = _uiState.value.timeline.videoTracks.firstOrNull()?.clipAt(playhead)
