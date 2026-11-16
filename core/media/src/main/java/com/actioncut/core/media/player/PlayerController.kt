@@ -7,6 +7,7 @@ import android.net.Uri
 import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
@@ -107,7 +108,10 @@ class PlayerController @Inject constructor(
         val items = clips.map { clip ->
             val builder = MediaItem.Builder().setUri(clip.mediaUri)
             if (clip.type == ClipType.IMAGE) {
-                builder.setImageDurationMs(clip.timelineDurationMs)
+                // Explicit image MIME type is required for file:// captures so ExoPlayer routes
+                // them through ImageRenderer just like content:// Gallery photos.
+                builder.setMimeType(resolveImageMimeType(clip.mediaUri))
+                builder.setImageDurationMs(clip.timelineDurationMs.coerceAtLeast(100L))
             } else {
                 builder.setClippingConfiguration(
                     MediaItem.ClippingConfiguration.Builder()
@@ -148,7 +152,8 @@ class PlayerController @Inject constructor(
         val uri = clip.mediaUri ?: return
         val item = MediaItem.Builder()
             .setUri(uri)
-            .setImageDurationMs(clip.timelineDurationMs)
+            .setMimeType(resolveImageMimeType(uri))
+            .setImageDurationMs(clip.timelineDurationMs.coerceAtLeast(100L))
             .build()
         previewClips = previewClips + clip
         clipVolumes = clipVolumes + clip.volume
@@ -156,7 +161,22 @@ class PlayerController @Inject constructor(
         videoStartsMs = videoStartsMs + newStart
         totalPreviewMs = newStart + previewDurationMs(clip)
         player.addMediaItem(item)
+        if (player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) {
+            player.prepare()
+        }
         pushState()
+    }
+
+    private fun resolveImageMimeType(uriString: String?): String {
+        if (uriString.isNullOrBlank()) return MimeTypes.IMAGE_JPEG
+        val probed = runCatching { context.contentResolver.getType(Uri.parse(uriString)) }.getOrNull()
+        if (!probed.isNullOrBlank() && MimeTypes.isImage(probed)) return probed
+        val lower = uriString.lowercase()
+        return when {
+            lower.endsWith(".png") -> MimeTypes.IMAGE_PNG
+            lower.endsWith(".webp") -> MimeTypes.IMAGE_WEBP
+            else -> MimeTypes.IMAGE_JPEG
+        }
     }
 
     /** Restores preview decoders/surfaces after Home button or screen-off resume. */
@@ -275,6 +295,9 @@ class PlayerController @Inject constructor(
     }
 
     fun play() {
+        if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+            player.prepare()
+        }
         if (player.playbackState == Player.STATE_ENDED) seekTo(0)
         player.play()
     }
@@ -289,6 +312,9 @@ class PlayerController @Inject constructor(
         if (player.isPlaying) {
             pause()
         } else {
+            if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+                player.prepare()
+            }
             if (player.playbackState == Player.STATE_ENDED) seekTo(0)
             player.play()
         }
