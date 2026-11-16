@@ -14,19 +14,29 @@ import com.actioncut.core.model.TransitionType
 /** Which edge of a clip a transition animates. */
 internal enum class TransitionEdge { IN, OUT }
 
-/** The achievable per-clip transition behaviours (no neighbour compositing required). */
-internal enum class TransitionKind { FADE, ZOOM, BLUR }
+/** Supported per-clip boundary transition shaders. */
+internal enum class TransitionKind {
+    NONE,
+    FADE,
+    ZOOM,
+    BLUR,
+    SLIDE_LEFT,
+    SLIDE_RIGHT,
+    SLIDE_UP,
+    SLIDE_DOWN,
+    MOVE_LEFT,
+    MOVE_RIGHT,
+    MOVE_UP,
+    MOVE_DOWN,
+    WIPE_LEFT,
+    WIPE_RIGHT,
+    WIPE_UP,
+    WIPE_DOWN,
+}
 
 /**
- * A boundary transition rendered as a per-clip edge effect. Media3 Transformer plays clips
- * back-to-back without cross-clip compositing, so true A→B crossfades aren't possible; we
- * instead ramp the clip's own [edge]:
- *  - [TransitionKind.FADE] — fade through black (FADE/DISSOLVE, and the honest fallback for
- *    directional Slide/Wipe which would need the neighbouring frame).
- *  - [TransitionKind.ZOOM] — push in toward centre.
- *  - [TransitionKind.BLUR] — ramp a cheap box blur.
- *
- * Pairing an out-edge on clip A with an in-edge on clip B reads as a transition between them.
+ * Per-clip boundary transition GL effect covering Fade/Crossfade, Slide R/L/U/D,
+ * Move R/L/U/D, Wipe R/L/U/D, Zoom, Blur, and Seamless (passthrough).
  */
 internal class TransitionEffect(
     private val edge: TransitionEdge,
@@ -39,13 +49,23 @@ internal class TransitionEffect(
         TransitionProgram(useHdr, edge, kind, edgeDurationUs, clipDurationUs)
 
     companion object {
-        /** Maps a [TransitionType] to the closest achievable per-clip behaviour. */
         fun kindFor(type: TransitionType): TransitionKind = when (type) {
+            TransitionType.NONE, TransitionType.SEAMLESS -> TransitionKind.NONE
+            TransitionType.FADE, TransitionType.DISSOLVE, TransitionType.CROSSFADE -> TransitionKind.FADE
             TransitionType.ZOOM_IN, TransitionType.ZOOM_OUT -> TransitionKind.ZOOM
             TransitionType.BLUR -> TransitionKind.BLUR
-            // Fade, dissolve, and directional slide/wipe (which need the neighbour frame)
-            // all degrade to a fade-through-black at export.
-            else -> TransitionKind.FADE
+            TransitionType.SLIDE_LEFT -> TransitionKind.SLIDE_LEFT
+            TransitionType.SLIDE_RIGHT -> TransitionKind.SLIDE_RIGHT
+            TransitionType.SLIDE_UP -> TransitionKind.SLIDE_UP
+            TransitionType.SLIDE_DOWN -> TransitionKind.SLIDE_DOWN
+            TransitionType.MOVE_LEFT -> TransitionKind.MOVE_LEFT
+            TransitionType.MOVE_RIGHT -> TransitionKind.MOVE_RIGHT
+            TransitionType.MOVE_UP -> TransitionKind.MOVE_UP
+            TransitionType.MOVE_DOWN -> TransitionKind.MOVE_DOWN
+            TransitionType.WIPE, TransitionType.WIPE_RIGHT -> TransitionKind.WIPE_RIGHT
+            TransitionType.WIPE_LEFT -> TransitionKind.WIPE_LEFT
+            TransitionType.WIPE_UP -> TransitionKind.WIPE_UP
+            TransitionType.WIPE_DOWN -> TransitionKind.WIPE_DOWN
         }
     }
 }
@@ -77,7 +97,6 @@ private class TransitionProgram(
     }
 
     override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
-        // f = 1 fully visible, 0 fully transitioned, ramped only within the edge window.
         val t = presentationTimeUs.coerceIn(0L, clipDurationUs.coerceAtLeast(1L))
         val f = when (edge) {
             TransitionEdge.IN ->
@@ -85,20 +104,54 @@ private class TransitionProgram(
             TransitionEdge.OUT ->
                 if (edgeDurationUs > 0L) ((clipDurationUs - t).toFloat() / edgeDurationUs).coerceIn(0f, 1f) else 1f
         }
-        val alpha: Float
-        val scale: Float
-        val blur: Float
+        val rem = 1f - f
+        var alpha = 1f
+        var scale = 1f
+        var blur = 0f
+        var offX = 0f
+        var offY = 0f
+        var wipeDir = 0f
+
         when (kind) {
-            TransitionKind.FADE -> { alpha = f; scale = 1f; blur = 0f }
-            TransitionKind.ZOOM -> { alpha = 1f; scale = 1f + (1f - f) * 0.25f; blur = 0f }
-            TransitionKind.BLUR -> { alpha = 1f; scale = 1f; blur = (1f - f) * 8f }
+            TransitionKind.NONE -> Unit
+            TransitionKind.FADE -> alpha = f
+            TransitionKind.ZOOM -> scale = 1f + rem * 0.25f
+            TransitionKind.BLUR -> blur = rem * 8f
+            TransitionKind.SLIDE_RIGHT -> offX = if (edge == TransitionEdge.IN) rem else -rem
+            TransitionKind.SLIDE_LEFT -> offX = if (edge == TransitionEdge.IN) -rem else rem
+            TransitionKind.SLIDE_UP -> offY = if (edge == TransitionEdge.IN) rem else -rem
+            TransitionKind.SLIDE_DOWN -> offY = if (edge == TransitionEdge.IN) -rem else rem
+            TransitionKind.MOVE_RIGHT -> {
+                alpha = 0.7f + 0.3f * f
+                offX = (if (edge == TransitionEdge.IN) rem else -rem) * 0.30f
+            }
+            TransitionKind.MOVE_LEFT -> {
+                alpha = 0.7f + 0.3f * f
+                offX = (if (edge == TransitionEdge.IN) -rem else rem) * 0.30f
+            }
+            TransitionKind.MOVE_UP -> {
+                alpha = 0.7f + 0.3f * f
+                offY = (if (edge == TransitionEdge.IN) rem else -rem) * 0.30f
+            }
+            TransitionKind.MOVE_DOWN -> {
+                alpha = 0.7f + 0.3f * f
+                offY = (if (edge == TransitionEdge.IN) -rem else rem) * 0.30f
+            }
+            TransitionKind.WIPE_RIGHT -> wipeDir = 1f
+            TransitionKind.WIPE_LEFT -> wipeDir = 2f
+            TransitionKind.WIPE_UP -> wipeDir = 3f
+            TransitionKind.WIPE_DOWN -> wipeDir = 4f
         }
+
         try {
             program.use()
             program.setSamplerTexIdUniform("uTexSampler", inputTexId, /* texUnitIndex= */ 0)
             program.setFloatsUniformIfPresent("uAlpha", floatArrayOf(alpha))
             program.setFloatsUniformIfPresent("uScale", floatArrayOf(scale))
             program.setFloatsUniformIfPresent("uBlur", floatArrayOf(blur))
+            program.setFloatsUniformIfPresent("uOffset", floatArrayOf(offX, offY))
+            program.setFloatsUniformIfPresent("uWipeDir", floatArrayOf(wipeDir))
+            program.setFloatsUniformIfPresent("uProgress", floatArrayOf(f))
             program.setFloatsUniformIfPresent("uResolution", floatArrayOf(width.toFloat(), height.toFloat()))
             program.bindAttributesAndUniforms()
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, /* first= */ 0, /* count= */ 4)
@@ -134,10 +187,28 @@ private class TransitionProgram(
             uniform float uAlpha;
             uniform float uScale;
             uniform float uBlur;
+            uniform vec2 uOffset;
+            uniform float uWipeDir;
+            uniform float uProgress;
             uniform vec2 uResolution;
             varying vec2 vTexSamplingCoord;
             void main() {
-              vec2 uv = (vTexSamplingCoord - 0.5) / uScale + 0.5; // zoom toward centre
+              if (uWipeDir > 0.5 && uWipeDir < 1.5 && vTexSamplingCoord.x > uProgress) {
+                gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;
+              }
+              if (uWipeDir > 1.5 && uWipeDir < 2.5 && vTexSamplingCoord.x < (1.0 - uProgress)) {
+                gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;
+              }
+              if (uWipeDir > 2.5 && uWipeDir < 3.5 && vTexSamplingCoord.y > uProgress) {
+                gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;
+              }
+              if (uWipeDir > 3.5 && vTexSamplingCoord.y < (1.0 - uProgress)) {
+                gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;
+              }
+              vec2 uv = (vTexSamplingCoord - 0.5) / uScale + 0.5 + uOffset;
+              if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+                gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;
+              }
               vec4 c;
               if (uBlur > 0.0) {
                 vec2 px = uBlur / uResolution;
