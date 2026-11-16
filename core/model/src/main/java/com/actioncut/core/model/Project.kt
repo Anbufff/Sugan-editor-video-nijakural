@@ -17,7 +17,7 @@ enum class AspectRatio(val width: Int, val height: Int, val label: String) {
     val value: Float get() = width.toFloat() / height.toFloat()
 
     companion object {
-        val DEFAULT = RATIO_9_16
+        val DEFAULT = RATIO_16_9
     }
 }
 
